@@ -1,0 +1,14 @@
+[
+  {
+    "timestamp": "test",
+    "action": "BAN",
+    "details": {
+      "userId": "test",
+      "userTag": "test",
+      "guildId": "test",
+      "guildName": "test",
+      "channelId": "test",
+      "reason": "在受保護頻道發送訊息"
+    }
+  }
+]
