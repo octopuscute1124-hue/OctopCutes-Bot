@@ -1,14 +1,38 @@
 [
   {
-    "timestamp": "test",
+    "timestamp": "2026-07-21T13:36:59.409Z",
     "action": "BAN",
     "details": {
-      "userId": "test",
-      "userTag": "test",
-      "guildId": "test",
-      "guildName": "test",
-      "channelId": "test",
+      "userId": "869948921772904468",
+      "userTag": "chopsticks_1244",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "channelId": "1133709967896105040",
       "reason": "在受保護頻道發送訊息"
+    }
+  },
+  {
+    "timestamp": "2026-07-21T13:59:08.178Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "黑名單移除",
+      "target": "869948921772904468"
+    }
+  },
+  {
+    "timestamp": "2026-07-21T14:07:23.114Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "啟動保護",
+      "target": "#一 (1133709967896105040)"
     }
   }
 ]
