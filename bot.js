@@ -13,7 +13,9 @@ const client = new Client({
 
 const BLACKLIST_FILE = './blacklist.json';
 const CONFIG_FILE = './config.json';
+const LOG_FILE = './logs.json';
 
+// ============ 黑名單 ============
 function loadBlacklist() {
     try {
         if (fs.existsSync(BLACKLIST_FILE)) {
@@ -45,30 +47,104 @@ function addToBlacklist(userId) {
     return false;
 }
 
-function loadConfig() {
-    try {
-        if (fs.existsSync(CONFIG_FILE)) {
-            const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-            return JSON.parse(data);
-        }
-    } catch (error) {
-        console.error('讀取設定檔失敗:', error);
-    }
-    return { monitoredChannels: {} };
-}
+// ============ Config 儲存（純陣列版） ============
+// 儲存結構：{ "guildId": ["channelId1", "channelId2"] }
+const monitoredChannels = {}; // 改用物件，不用 Map
 
 function saveConfig() {
     try {
-        const data = {
-            monitoredChannels: Object.fromEntries(monitoredChannels)
-        };
-        fs.writeFileSync(CONFIG_FILE, JSON.stringify(data, null, 2));
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify({ monitoredChannels: monitoredChannels }, null, 2));
         console.log('✅ 設定已儲存');
     } catch (error) {
         console.error('儲存設定失敗:', error);
     }
 }
 
+function loadConfig() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            const data = fs.readFileSync(CONFIG_FILE, 'utf8');
+            const parsed = JSON.parse(data);
+            if (parsed.monitoredChannels) {
+                return parsed.monitoredChannels;
+            }
+        }
+    } catch (error) {
+        console.error('讀取設定檔失敗:', error);
+    }
+    return {};
+}
+
+// ============ 日誌 ============
+function logAction(action, details) {
+    try {
+        let logs = [];
+        if (fs.existsSync(LOG_FILE)) {
+            const data = fs.readFileSync(LOG_FILE, 'utf8');
+            logs = JSON.parse(data);
+        }
+        logs.push({
+            timestamp: new Date().toISOString(),
+            action: action,
+            details: details
+        });
+        if (logs.length > 1000) {
+            logs = logs.slice(-1000);
+        }
+        fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+    } catch (error) {
+        console.error('寫入日誌失敗:', error);
+    }
+}
+
+// ============ 統一 Ban 函數 ============
+async function banUser(member, reason, logReason, channel = null) {
+    const userId = member.id;
+    const userTag = member.user.tag;
+    const guild = member.guild;
+
+    try {
+        await member.ban({
+            reason: reason,
+            deleteMessageDays: 7
+        });
+
+        if (addToBlacklist(userId)) {
+            console.log(`📋 已加入黑名單: ${userTag} (${userId})`);
+        }
+
+        logAction('BAN', {
+            userId: userId,
+            userTag: userTag,
+            guildId: guild.id,
+            guildName: guild.name,
+            channelId: channel ? channel.id : null,
+            reason: logReason
+        });
+
+        console.log(`🔨 已 Ban ${userTag} (${userId})`);
+
+        if (channel) {
+            const embed = new EmbedBuilder()
+                .setColor(0xff0000)
+                .setTitle('🔨 防傳銷觸發')
+                .setDescription(`**${userTag}** 已被 Ban 並加入全域黑名單`)
+                .addFields(
+                    { name: '原因', value: logReason, inline: true },
+                    { name: '黑名單', value: `已記錄 (${loadBlacklist().bannedUsers.length} 人)`, inline: true },
+                    { name: '時間', value: new Date().toLocaleString(), inline: true }
+                );
+            await channel.send({ embeds: [embed] });
+        }
+
+        return true;
+    } catch (error) {
+        console.error(`Ban 失敗 (${userTag}):`, error.message);
+        return false;
+    }
+}
+
+// ============ 止損機制 ============
 const mentionTracker = new Map();
 
 function checkMentionSpam(userId, channelId, guildId) {
@@ -94,22 +170,28 @@ function checkMentionSpam(userId, channelId, guildId) {
     return false;
 }
 
-const monitoredChannels = new Map();
+// ============ 分頁紀錄 ============
 const userPage = new Map();
 
+// ============ 機器人啟動 ============
 client.once(Events.ClientReady, async (readyClient) => {
     console.log(`✅ 已登入為 ${readyClient.user.tag}`);
     console.log(`📋 黑名單數量: ${loadBlacklist().bannedUsers.length} 人`);
     
-    const config = loadConfig();
-    for (const [guildId, channelIds] of Object.entries(config.monitoredChannels || {})) {
-        if (Array.isArray(channelIds)) {
-            monitoredChannels.set(guildId, new Set(channelIds));
-        } else {
-            monitoredChannels.set(guildId, new Set());
+    // 載入設定
+    const loaded = loadConfig();
+    console.log('📂 從 config.json 讀取到的內容:', JSON.stringify(loaded, null, 2));
+    
+    // 合併到 monitoredChannels
+    for (const [guildId, channelIds] of Object.entries(loaded)) {
+        if (Array.isArray(channelIds) && channelIds.length > 0) {
+            monitoredChannels[guildId] = channelIds;
+            console.log(`✅ 載入 ${channelIds.length} 個頻道 (伺服器 ${guildId})`);
         }
     }
-    console.log(`📂 載入 ${getTotalMonitored()} 個受保護頻道`);
+    
+    const total = getTotalMonitored();
+    console.log(`📂 總共載入 ${total} 個受保護頻道`);
     
     try {
         const commands = await client.application.commands.fetch();
@@ -118,13 +200,14 @@ client.once(Events.ClientReady, async (readyClient) => {
         }
     } catch (error) {}
     
-    console.log(`🤖 監控 ${getTotalMonitored()} 個頻道`);
+    console.log(`🤖 監控 ${total} 個頻道`);
     console.log('📡 輸入 !章魚 開啟控制面板');
     
     await scanAllServers();
     await scanProtectedChannels();
 });
 
+// ============ 掃描所有伺服器 ============
 async function scanAllServers() {
     const blacklist = loadBlacklist();
     if (blacklist.bannedUsers.length === 0) {
@@ -143,16 +226,14 @@ async function scanAllServers() {
             for (const userId of blacklist.bannedUsers) {
                 const member = members.get(userId);
                 if (member && !member.user.bot) {
-                    try {
-                        await member.ban({
-                            reason: '🐙 全域黑名單 - 曾在其他伺服器觸發防傳銷',
-                            deleteMessageDays: 7
-                        });
+                    const success = await banUser(
+                        member,
+                        '🐙 全域黑名單 - 曾在其他伺服器觸發防傳銷',
+                        '全域黑名單掃描'
+                    );
+                    if (success) {
                         found++;
                         totalBanned++;
-                        console.log(`🔨 全域封鎖: ${member.user.tag} (${userId}) 在 ${guild.name}`);
-                    } catch (err) {
-                        console.log(`⚠️ 無法 Ban ${userId} 在 ${guild.name}: ${err.message}`);
                     }
                 }
             }
@@ -168,6 +249,7 @@ async function scanAllServers() {
     console.log(`✅ 全域掃描完成，共封鎖 ${totalBanned} 人`);
 }
 
+// ============ 掃描受保護頻道 ============
 async function scanProtectedChannels() {
     const blacklist = loadBlacklist();
     if (blacklist.bannedUsers.length === 0) {
@@ -178,8 +260,8 @@ async function scanProtectedChannels() {
     console.log(`🔍 開始掃描受保護頻道...`);
     let totalBanned = 0;
 
-    for (const [guildId, channelIds] of monitoredChannels) {
-        if (channelIds.size === 0) continue;
+    for (const [guildId, channelIds] of Object.entries(monitoredChannels)) {
+        if (channelIds.length === 0) continue;
 
         const guild = client.guilds.cache.get(guildId);
         if (!guild) {
@@ -201,16 +283,15 @@ async function scanProtectedChannels() {
 
                     const perms = channel.permissionsFor(member);
                     if (perms && perms.has(PermissionFlagsBits.ViewChannel)) {
-                        try {
-                            await member.ban({
-                                reason: '🐙 黑名單掃描 - 位於受保護頻道中',
-                                deleteMessageDays: 7
-                            });
+                        const success = await banUser(
+                            member,
+                            '🐙 黑名單掃描 - 位於受保護頻道中',
+                            '黑名單掃描 - 位於受保護頻道中',
+                            channel
+                        );
+                        if (success) {
                             found++;
                             totalBanned++;
-                            console.log(`🔨 保護頻道掃描封鎖: ${member.user.tag} (${userId}) 在 ${guild.name} / #${channel.name}`);
-                        } catch (err) {
-                            console.log(`⚠️ 無法 Ban ${userId} 在 ${guild.name}: ${err.message}`);
                         }
                         break;
                     }
@@ -228,6 +309,7 @@ async function scanProtectedChannels() {
     console.log(`✅ 保護頻道掃描完成，共封鎖 ${totalBanned} 人`);
 }
 
+// ============ !章魚 指令 ============
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
     if (message.content.trim() !== '!章魚') return;
@@ -238,13 +320,14 @@ client.on(Events.MessageCreate, async (message) => {
     await showPanel(message, 0);
 });
 
+// ============ 顯示面板 ============
 async function showPanel(message, page = 0) {
     const guildId = message.guildId;
-    if (!monitoredChannels.has(guildId)) {
-        monitoredChannels.set(guildId, new Set());
+    if (!monitoredChannels[guildId]) {
+        monitoredChannels[guildId] = [];
     }
 
-    const channels = monitoredChannels.get(guildId);
+    const channels = monitoredChannels[guildId];
     const guild = message.guild;
     const blacklist = loadBlacklist();
 
@@ -260,7 +343,7 @@ async function showPanel(message, page = 0) {
     const pageChannels = textChannels.slice(start, end);
 
     const options = pageChannels.map(ch => {
-        const isProtected = channels.has(ch.id);
+        const isProtected = channels.includes(ch.id);
         return {
             label: ch.name.slice(0, 25),
             value: ch.id,
@@ -271,7 +354,7 @@ async function showPanel(message, page = 0) {
 
     const selectMenu = new StringSelectMenuBuilder()
         .setCustomId('select_channel')
-        .setPlaceholder(`📂 第 ${page + 1}/${totalPages} 頁 (${channels.size}/${total} 已保護)`)
+        .setPlaceholder(`📂 第 ${page + 1}/${totalPages} 頁 (${channels.length}/${total} 已保護)`)
         .addOptions(options);
 
     const row1 = new ActionRowBuilder().addComponents(selectMenu);
@@ -307,16 +390,16 @@ async function showPanel(message, page = 0) {
         .setTitle('🐙 防傳銷控制面板')
         .setDescription(`第 ${page + 1}/${totalPages} 頁 • 從下拉選單選擇頻道`)
         .addFields(
-            { name: '📊 受保護', value: `${channels.size} 個`, inline: true },
+            { name: '📊 受保護', value: `${channels.length} 個`, inline: true },
             { name: '📊 總頻道', value: `${total} 個`, inline: true },
             { name: '📋 黑名單', value: `${blacklist.bannedUsers.length} 人`, inline: true },
             { 
                 name: '📋 保護清單', 
-                value: channels.size > 0 ? 
-                    [...channels].slice(0, 15).map(id => {
+                value: channels.length > 0 ? 
+                    channels.slice(0, 15).map(id => {
                         const ch = guild.channels.cache.get(id);
                         return ch ? `🔒 <#${id}>` : '🔒 已刪除';
-                    }).join('\n') + (channels.size > 15 ? `\n... 還有 ${channels.size - 15} 個` : '') : 
+                    }).join('\n') + (channels.length > 15 ? `\n... 還有 ${channels.length - 15} 個` : '') : 
                     '⚠️ 無',
                 inline: false 
             }
@@ -330,6 +413,7 @@ async function showPanel(message, page = 0) {
     });
 }
 
+// ============ 互動處理 ============
 client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isStringSelectMenu() && !interaction.isButton()) return;
 
@@ -338,11 +422,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     const guildId = interaction.guildId;
-    if (!monitoredChannels.has(guildId)) {
-        monitoredChannels.set(guildId, new Set());
+    if (!monitoredChannels[guildId]) {
+        monitoredChannels[guildId] = [];
     }
 
-    const channels = monitoredChannels.get(guildId);
+    const channels = monitoredChannels[guildId];
     const userId = interaction.user.id;
     const currentPage = userPage.get(userId) || 0;
 
@@ -360,14 +444,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 return interaction.reply({ content: `❌ 沒有 Ban 權限！`, flags: 64 });
             }
 
-            if (channels.has(channelId)) {
-                channels.delete(channelId);
+            const index = channels.indexOf(channelId);
+            if (index !== -1) {
+                channels.splice(index, 1);
                 await interaction.reply({ content: `🔓 已解除 <#${channelId}> 保護`, flags: 64 });
             } else {
-                channels.add(channelId);
+                channels.push(channelId);
                 await interaction.reply({ content: `🛡️ 已啟動 <#${channelId}> 保護！`, flags: 64 });
+                try {
+                    await channel.send({
+                        content: `⚠️ **此頻道已啟動防傳銷保護！**\n任何人在此頻道發送訊息將會被 **Ban** 並加入全域黑名單。\n管理員請謹慎操作，誤 Ban 風險自負。`
+                    });
+                } catch (e) {}
             }
+            
             saveConfig();
+            console.log(`📝 目前保護頻道: ${channels.join(', ')}`);
             await updatePanel(interaction, currentPage);
 
         } else if (interaction.isButton() && interaction.customId === 'prev_page') {
@@ -435,15 +527,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         console.error('錯誤:', error);
         try {
             await interaction.reply({ content: '❌ 操作失敗', flags: 64 });
-        } catch (e) {
-            console.error('回應失敗:', e);
-        }
+        } catch (e) {}
     }
 });
 
+// ============ 更新面板 ============
 async function updatePanel(interaction, page = 0) {
     const guildId = interaction.guildId;
-    const channels = monitoredChannels.get(guildId) || new Set();
+    const channels = monitoredChannels[guildId] || [];
     const guild = interaction.guild;
     const blacklist = loadBlacklist();
 
@@ -459,7 +550,7 @@ async function updatePanel(interaction, page = 0) {
     const pageChannels = textChannels.slice(start, end);
 
     const options = pageChannels.map(ch => {
-        const isProtected = channels.has(ch.id);
+        const isProtected = channels.includes(ch.id);
         return {
             label: ch.name.slice(0, 25),
             value: ch.id,
@@ -470,7 +561,7 @@ async function updatePanel(interaction, page = 0) {
 
     const selectMenu = new StringSelectMenuBuilder()
         .setCustomId('select_channel')
-        .setPlaceholder(`📂 第 ${page + 1}/${totalPages} 頁 (${channels.size}/${total} 已保護)`)
+        .setPlaceholder(`📂 第 ${page + 1}/${totalPages} 頁 (${channels.length}/${total} 已保護)`)
         .addOptions(options);
 
     const row1 = new ActionRowBuilder().addComponents(selectMenu);
@@ -506,16 +597,16 @@ async function updatePanel(interaction, page = 0) {
         .setTitle('🐙 防傳銷控制面板')
         .setDescription(`第 ${page + 1}/${totalPages} 頁 • 從下拉選單選擇頻道`)
         .addFields(
-            { name: '📊 受保護', value: `${channels.size} 個`, inline: true },
+            { name: '📊 受保護', value: `${channels.length} 個`, inline: true },
             { name: '📊 總頻道', value: `${total} 個`, inline: true },
             { name: '📋 黑名單', value: `${blacklist.bannedUsers.length} 人`, inline: true },
             { 
                 name: '📋 保護清單', 
-                value: channels.size > 0 ? 
-                    [...channels].slice(0, 15).map(id => {
+                value: channels.length > 0 ? 
+                    channels.slice(0, 15).map(id => {
                         const ch = guild.channels.cache.get(id);
                         return ch ? `🔒 <#${id}>` : '🔒 已刪除';
-                    }).join('\n') + (channels.size > 15 ? `\n... 還有 ${channels.size - 15} 個` : '') : 
+                    }).join('\n') + (channels.length > 15 ? `\n... 還有 ${channels.length - 15} 個` : '') : 
                     '⚠️ 無',
                 inline: false 
             }
@@ -529,6 +620,7 @@ async function updatePanel(interaction, page = 0) {
     });
 }
 
+// ============ 防傳銷核心 ============
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
     
@@ -552,29 +644,17 @@ client.on(Events.MessageCreate, async (message) => {
                     return;
                 }
                 
-                await member.ban({
-                    reason: '🐙 止損機制 - 1秒內在兩個頻道 @everyone/@here',
-                    deleteMessageDays: 7
-                });
-                
-                if (addToBlacklist(userId)) {
-                    console.log(`📋 已加入黑名單: ${message.author.tag} (${userId})`);
+                const success = await banUser(
+                    member,
+                    '🐙 止損機制 - 1秒內在兩個頻道 @everyone/@here',
+                    '1秒內在兩個頻道 @everyone/@here',
+                    message.channel
+                );
+                if (success) {
+                    try {
+                        await message.delete();
+                    } catch (e) {}
                 }
-                
-                const embed = new EmbedBuilder()
-                    .setColor(0xff0000)
-                    .setTitle('🔨 止損機制觸發')
-                    .setDescription(`**${message.author.tag}** 已被 Ban 並加入全域黑名單`)
-                    .addFields(
-                        { name: '原因', value: '1秒內在兩個頻道 @everyone/@here', inline: true },
-                        { name: '黑名單', value: `已記錄 (${loadBlacklist().bannedUsers.length} 人)`, inline: true },
-                        { name: '時間', value: new Date().toLocaleString(), inline: true }
-                    );
-                await message.channel.send({ embeds: [embed] });
-                
-                try {
-                    await message.delete();
-                } catch (e) {}
                 
             } catch (error) {
                 console.error('止損 Ban 失敗:', error);
@@ -584,52 +664,37 @@ client.on(Events.MessageCreate, async (message) => {
         }
     }
     
-    const channels = monitoredChannels.get(guildId);
-    if (!channels) return;
-    if (!channels.has(message.channelId)) return;
+    const channels = monitoredChannels[guildId] || [];
+    if (!channels.includes(message.channelId)) return;
 
     try {
         const member = await message.guild.members.fetch(message.author.id);
         if (member.permissions.has(PermissionFlagsBits.Administrator)) return;
 
-        await member.ban({
-            reason: '🐙 防傳銷機制 - 已加入全域黑名單',
-            deleteMessageDays: 7
-        });
-
-        const userId = message.author.id;
-        if (addToBlacklist(userId)) {
-            console.log(`📋 已加入黑名單: ${message.author.tag} (${userId})`);
-        }
-
-        console.log(`🔨 已 Ban ${message.author.tag} (${userId})`);
-        
-        const embed = new EmbedBuilder()
-            .setColor(0xff0000)
-            .setTitle('🔨 防傳銷觸發')
-            .setDescription(`**${message.author.tag}** 已被 Ban 並加入全域黑名單`)
-            .addFields(
-                { name: '原因', value: '在受保護頻道發送訊息', inline: true },
-                { name: '黑名單', value: `已記錄 (${loadBlacklist().bannedUsers.length} 人)`, inline: true },
-                { name: '時間', value: new Date().toLocaleString(), inline: true }
-            );
-        await message.channel.send({ embeds: [embed] });
+        await banUser(
+            member,
+            '🐙 防傳銷機制 - 已加入全域黑名單',
+            '在受保護頻道發送訊息',
+            message.channel
+        );
 
     } catch (error) {
         console.error('Ban 失敗:', error);
     }
 });
 
+// ============ 定期掃描 ============
 setInterval(async () => {
     console.log('🔄 定期掃描黑名單...');
     await scanAllServers();
     await scanProtectedChannels();
 }, 30 * 60 * 1000);
 
+// ============ 輔助函數 ============
 function getTotalMonitored() {
     let total = 0;
-    for (const [key, value] of monitoredChannels) {
-        total += value.size;
+    for (const [key, value] of Object.entries(monitoredChannels)) {
+        total += value.length;
     }
     return total;
 }
