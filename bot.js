@@ -236,8 +236,11 @@ function checkInterval(trackerKey, maxInterval, timeWindow) {
 function cleanupTrackers() {
     const now = Date.now();
     for (const [key, data] of trackers) {
+        if (!data || !data.times) continue;
         data.times = data.times.filter(t => now - t < 60000);
-        if (data.times.length === 0 && now - data.last > 60000) trackers.delete(key);
+        if (data.times.length === 0 && (data.last || 0) + 60000 < now) {
+            trackers.delete(key);
+        }
     }
 }
 
@@ -370,10 +373,26 @@ async function showPanel(msg) {
     const sec = getSecurity(gid);
     const alert = getAlert(gid);
 
+    // ===== 自動清理過時訊息 =====
+    try {
+        const fetched = await msg.channel.messages.fetch({ limit: 20 });
+        const botMessages = fetched.filter(m => m.author.id === client.user.id);
+        if (botMessages.size > 1) {
+            // 保留最新的一則，刪除其他
+            const sorted = botMessages.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+            const toDelete = sorted.slice(1);
+            for (const m of toDelete) {
+                await m.delete().catch(() => {});
+            }
+            console.log(`🧹 清理了 ${toDelete.size} 則過時訊息`);
+        }
+    } catch (e) {
+        // 忽略清理錯誤
+    }
+
     const secCount = Object.values(sec).filter(v => v).length;
     const alertCount = Object.values(alert).filter(v => v).length;
 
-    // 第一行：主要功能
     const row1 = new ActionRowBuilder()
         .addComponents(
             new ButtonBuilder().setCustomId('sec').setLabel('🛡️ 安全設定').setStyle(3),
@@ -381,7 +400,6 @@ async function showPanel(msg) {
             new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2)
         );
 
-    // 第二行：開發者功能（只有開發者看到）
     const row2 = new ActionRowBuilder();
     if (isDev) {
         row2.addComponents(
@@ -405,7 +423,6 @@ async function showPanel(msg) {
         .setFooter({ text: `管理員 • ${guild.name}` })
         .setTimestamp();
 
-    // 組合成兩行
     const components = [row1];
     if (row2.components.length > 0) components.push(row2);
 
@@ -838,6 +855,19 @@ client.on(Events.InteractionCreate, async (i) => {
 
 async function showPanelFromInteraction(i) {
     try {
+        // ===== 清理過時訊息 =====
+        try {
+            const fetched = await i.channel.messages.fetch({ limit: 20 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            if (botMessages.size > 1) {
+                const sorted = botMessages.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+                const toDelete = sorted.slice(1);
+                for (const m of toDelete) {
+                    await m.delete().catch(() => {});
+                }
+            }
+        } catch (e) {}
+
         const gid = i.guildId;
         const guild = i.guild;
         const bl = loadBlacklist();
