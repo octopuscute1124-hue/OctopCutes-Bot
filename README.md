@@ -192,6 +192,15 @@ node bot.js
 - 移除頻道備份/還原功能
 - 移除 `channel_backup.json` 檔案
 
+## [V0.2.1] - 2026-07-22
+
+### 🐛 修復
+- 修復 `cleanupTrackers` 間歇性崩潰問題 (TypeError: Cannot read properties of undefined)
+- 加入防呆檢查，避免追蹤器資料為空時噴錯
+
+### 🔧 優化
+- 提升追蹤器清理機制的穩定性
+
 ---
 
 ## :pray: 銘謝
