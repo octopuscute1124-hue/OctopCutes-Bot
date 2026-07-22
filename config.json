@@ -1,11 +1,50 @@
 {
-  "monitoredChannels": {
-    "1132341357701255169": [
-      "1133709967896105040"
-    ]
-  },
   "whitelist": {
     "users": [],
     "roles": []
-  }
+  },
+  "securitySettings": {
+    "1132341357701255169": {
+      "stopLoss": true,
+      "mentionSpeed": true,
+      "scriptDetection": true,
+      "voiceAbuse": true,
+      "webhookMonitor": true,
+      "selfbotDetection": true,
+      "floodProtection": true,
+      "floodJoin": true,
+      "permissionSpam": true,
+      "maliciousFile": true,
+      "xssProtection": true,
+      "richPresence": true,
+      "crawlerDetection": true,
+      "collusionAttack": true,
+      "suspiciousAccount": true,
+      "bruteForce": true,
+      "rateLimit": true,
+      "autoDegrade": true,
+      "commandWhitelist": true,
+      "inviteMonitor": true,
+      "roleLock": true,
+      "channelSpam": true,
+      "logRetention": 30
+    }
+  },
+  "alertSettings": {
+    "1132341357701255169": {
+      "suspiciousAccount": true,
+      "floodJoin": true,
+      "webhookAbuse": true,
+      "permissionAbuse": true,
+      "botBanned": true,
+      "channelSpam": true,
+      "roleAbuse": true,
+      "inviteAbuse": true,
+      "richPresence": true
+    }
+  },
+  "alertChannelId": {
+    "1132341357701255169": "1288851639771332751"
+  },
+  "autoResponses": {}
 }

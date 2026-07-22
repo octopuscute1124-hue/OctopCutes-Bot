@@ -34,5 +34,125 @@
       "action": "啟動保護",
       "target": "#一 (1133709967896105040)"
     }
+  },
+  {
+    "timestamp": "2026-07-22T13:34:39.520Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "設定警報頻道",
+      "target": "#草稿 (1288851639771332751)"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:34:39.521Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "設定警報頻道",
+      "target": "#草稿 (1288851639771332751)"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:35:08.438Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "警報功能切換",
+      "target": "roleAbuse -> 關閉"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:35:10.950Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "警報功能切換",
+      "target": "roleAbuse -> 啟用"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:44:18.574Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "警報切換",
+      "target": "suspiciousAccount -> 關閉"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:44:47.894Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "警報切換",
+      "target": "suspiciousAccount -> 啟用"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:44:50.937Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "警報切換",
+      "target": "suspiciousAccount -> 關閉"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:44:52.608Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "警報切換",
+      "target": "suspiciousAccount -> 啟用"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:48:51.175Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "安全切換",
+      "target": "commandWhitelist->關閉"
+    }
+  },
+  {
+    "timestamp": "2026-07-22T13:48:53.026Z",
+    "action": "ADMIN_ACTION",
+    "details": {
+      "adminId": "826962879663308800",
+      "adminTag": "octopodiformes",
+      "guildId": "1132341357701255169",
+      "guildName": "機器人",
+      "action": "安全切換",
+      "target": "commandWhitelist->啟用"
+    }
   }
 ]
