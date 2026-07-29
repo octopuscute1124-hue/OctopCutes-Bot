@@ -40,10 +40,17 @@ function saveJSON(file, data) {
 function loadBlacklist() { return loadJSON(BLACKLIST_FILE, { bannedUsers: [] }); }
 function saveBlacklist(data) { saveJSON(BLACKLIST_FILE, data); }
 
-function addToBlacklist(userId) {
+function addToBlacklist(userId, meta = {}) {
     const data = loadBlacklist();
     if (!data.bannedUsers.includes(userId)) {
         data.bannedUsers.push(userId);
+        data.records = data.records || {};
+        data.records[userId] = {
+            reason: meta.reason || '未知',
+            sourceGuildId: meta.guildId || null,
+            sourceGuildName: meta.guildName || null,
+            timestamp: new Date().toISOString()
+        };
         saveBlacklist(data);
         return true;
     }
@@ -66,8 +73,8 @@ function getDefaultSecurity() {
         webhookMonitor: true, selfbotDetection: true, floodProtection: true, floodJoin: true,
         permissionSpam: true, maliciousFile: true, xssProtection: true, richPresence: true,
         crawlerDetection: true, collusionAttack: true, suspiciousAccount: true, bruteForce: true,
-        rateLimit: true, autoDegrade: true, commandWhitelist: true, inviteMonitor: true,
-        roleLock: true, channelSpam: true, logRetention: 30
+        rateLimit: true, autoDegrade: true, inviteMonitor: true,
+        roleLock: true, channelSpam: true, honorGlobalBlacklist: true, logRetention: 30
     };
 }
 
@@ -178,7 +185,9 @@ function logAdmin(interaction, action, target) {
 async function banUser(member, reason, logReason, channel = null) {
     try {
         await member.ban({ reason, deleteMessageDays: 7 });
-        if (addToBlacklist(member.id)) console.log(`📋 黑名單: ${member.user.tag}`);
+        if (addToBlacklist(member.id, { reason: logReason, guildId: member.guild.id, guildName: member.guild.name })) {
+            console.log(`📋 黑名單: ${member.user.tag}`);
+        }
         logAction('BAN', {
             userId: member.id,
             userTag: member.user.tag,
@@ -204,6 +213,40 @@ async function banUser(member, reason, logReason, channel = null) {
     } catch (e) {
         console.error(`Ban 失敗 (${member.user.tag}):`, e.message);
         return false;
+    }
+}
+
+// 累犯計數：10 分鐘內同一使用者同一類型第 2 次觸犯才會被封鎖，降低單次誤判就永久 Ban 的風險
+function addStrike(userId, guildId, kind) {
+    const key = `strike_${kind}_${userId}_${guildId}`;
+    const now = Date.now();
+    if (!trackers.has(key) || now - trackers.get(key).last > 600000) {
+        trackers.set(key, { count: 0, last: now });
+    }
+    const d = trackers.get(key);
+    d.count++;
+    d.last = now;
+    return d.count;
+}
+
+async function warnUser(member, channel, reason, tag) {
+    try { await member.timeout(10 * 60 * 1000, `🐙 警告 - ${tag}`); } catch (_) {}
+    logAction('WARNING', {
+        userId: member.id,
+        userTag: member.user.tag,
+        guildId: member.guild.id,
+        guildName: member.guild.name,
+        reason: `${tag} - ${reason}`
+    });
+    console.log(`⚠️ 警告 ${member.user.tag}: ${tag}`);
+    if (channel) {
+        const embed = new EmbedBuilder()
+            .setColor(0xffaa00)
+            .setTitle('⚠️ 警告（未封鎖）')
+            .setDescription(`**${member.user.tag}** 已被禁言 10 分鐘，再次觸犯將被封鎖`)
+            .addFields({ name: '原因', value: reason, inline: true })
+            .setTimestamp();
+        await channel.send({ embeds: [embed] }).catch(() => {});
     }
 }
 
@@ -343,6 +386,10 @@ async function scanAll() {
     console.log(`🔍 掃描 ${client.guilds.cache.size} 個伺服器...`);
     let total = 0;
     for (const [, guild] of client.guilds.cache) {
+        if (getSecurity(guild.id).honorGlobalBlacklist === false) {
+            console.log(`⏭️ ${guild.name} 已選擇不套用全域黑名單，略過`);
+            continue;
+        }
         try {
             const members = await guild.members.fetch();
             for (const userId of blacklist.bannedUsers) {
@@ -361,6 +408,10 @@ client.on(Events.MessageCreate, async (msg) => {
     if (msg.author.bot || msg.content.trim() !== '!章魚') return;
     if (!msg.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return msg.reply('❌ 需要管理員權限！');
+    }
+    if (getSecurity(msg.guildId).bruteForce !== false) {
+        const bf = checkBruteForce(msg.author.id);
+        if (!bf.allowed) return msg.reply(`⚠️ ${bf.reason}`);
     }
     await showPanel(msg);
 });
@@ -430,27 +481,31 @@ async function showPanel(msg) {
 }
 
 // ============ 安全設定面板 ============
-async function showSecurityPanel(i) {
+// 原版把 22 個開關硬塞進最多 5 列元件的訊息裡，slice(0,20) 導致最後兩項
+// (roleLock、channelSpam) 永遠沒有按鈕、管理員完全無法切換。這裡改為分頁，
+// 確保每一個安全選項都能被實際操作到。
+const SECURITY_FEATURES = [
+    ['stopLoss', '止損'], ['mentionSpeed', '@mention'], ['scriptDetection', '腳本'],
+    ['voiceAbuse', '語音'], ['webhookMonitor', 'Webhook'], ['selfbotDetection', 'SelfBot'],
+    ['floodProtection', '洪水'], ['floodJoin', '洪水加入'], ['permissionSpam', '權限變更'],
+    ['maliciousFile', '惡意檔案'], ['xssProtection', 'XSS'], ['richPresence', 'RichP'],
+    ['crawlerDetection', '爬蟲'], ['collusionAttack', '撞庫'], ['suspiciousAccount', '可疑帳號'],
+    ['bruteForce', '面板冷卻'], ['rateLimit', 'RateLimit'], ['autoDegrade', '降級'],
+    ['inviteMonitor', '邀請'], ['roleLock', '角色鎖定'], ['channelSpam', '頻道監控']
+];
+const SEC_PAGE_SIZE = 10;
+
+async function showSecurityPanel(i, page = 0) {
     const gid = i.guildId;
     const sec = getSecurity(gid);
-    const features = [
-        ['stopLoss', '止損'], ['mentionSpeed', '@mention'], ['scriptDetection', '腳本'],
-        ['voiceAbuse', '語音'], ['webhookMonitor', 'Webhook'], ['selfbotDetection', 'SelfBot'],
-        ['floodProtection', '洪水'], ['floodJoin', '洪水加入'], ['permissionSpam', '權限變更'],
-        ['maliciousFile', '惡意檔案'], ['xssProtection', 'XSS'], ['richPresence', 'RichP'],
-        ['crawlerDetection', '爬蟲'], ['collusionAttack', '撞庫'], ['suspiciousAccount', '可疑帳號'],
-        ['bruteForce', '暴力破解'], ['rateLimit', 'RateLimit'], ['autoDegrade', '降級'],
-        ['commandWhitelist', '指令白名單'], ['inviteMonitor', '邀請'], ['roleLock', '角色鎖定'],
-        ['channelSpam', '頻道監控']
-    ];
+    const totalPages = Math.ceil(SECURITY_FEATURES.length / SEC_PAGE_SIZE);
+    page = Math.max(0, Math.min(page, totalPages - 1));
+    const pageFeatures = SECURITY_FEATURES.slice(page * SEC_PAGE_SIZE, page * SEC_PAGE_SIZE + SEC_PAGE_SIZE);
 
-    // 只顯示前 20 個（4行 x 5個）
-    const displayFeatures = features.slice(0, 20);
     const rows = [];
     let row = new ActionRowBuilder();
     let count = 0;
-
-    for (const [k, name] of displayFeatures) {
+    for (const [k, name] of pageFeatures) {
         const status = sec[k] !== undefined ? sec[k] : true;
         row.addComponents(
             new ButtonBuilder()
@@ -460,31 +515,25 @@ async function showSecurityPanel(i) {
                 .setEmoji(status ? '✅' : '❌')
         );
         count++;
-        if (count === 5) {
-            rows.push(row);
-            row = new ActionRowBuilder();
-            count = 0;
-        }
+        if (count === 5) { rows.push(row); row = new ActionRowBuilder(); count = 0; }
     }
     if (count > 0) rows.push(row);
 
-    // 狀態文字（只顯示前 20 個）
-    const statusText = displayFeatures.map(([k, name]) => {
+    const navRow = new ActionRowBuilder();
+    if (page > 0) navRow.addComponents(new ButtonBuilder().setCustomId(`secpage_${page - 1}`).setLabel('⬅️ 上一頁').setStyle(2));
+    if (page < totalPages - 1) navRow.addComponents(new ButtonBuilder().setCustomId(`secpage_${page + 1}`).setLabel('➡️ 下一頁').setStyle(2));
+    navRow.addComponents(new ButtonBuilder().setCustomId('back').setLabel('🔙 返回').setStyle(2));
+    rows.push(navRow);
+
+    const statusText = pageFeatures.map(([k, name]) => {
         const s = sec[k] !== undefined ? sec[k] : true;
         return `${s ? '✅' : '❌'} ${name}`;
     }).join('\n');
 
-    // 返回按鈕單獨一行
-    const backRow = new ActionRowBuilder()
-        .addComponents(
-            new ButtonBuilder().setCustomId('back').setLabel('🔙 返回').setStyle(2)
-        );
-    rows.push(backRow);
-
     const embed = new EmbedBuilder()
         .setColor(0x5865F2)
         .setTitle('🛡️ 安全設定')
-        .setDescription('點擊切換開關 (顯示前20項)')
+        .setDescription(`點擊切換開關（第 ${page + 1}/${totalPages} 頁）`)
         .addFields({ name: '📋 狀態', value: statusText, inline: false })
         .setFooter({ text: '管理員專用' })
         .setTimestamp();
@@ -635,19 +684,20 @@ client.on(Events.InteractionCreate, async (i) => {
     if (!i.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return i.reply({ content: '❌ 需要管理員權限！', flags: 64 });
     }
-    if (!checkRateLimit(i.user.id)) {
-        return i.reply({ content: '⚠️ 操作過頻繁', flags: 64 });
-    }
-    if (checkSystem() === 'emergency') {
-        return i.reply({ content: '🚨 系統保護模式', flags: 64 });
-    }
-    if (trackBehavior(i.user.id)) {
-        return i.reply({ content: '⚠️ 異常行為', flags: 64 });
-    }
-
     const gid = i.guildId;
     const uid = i.user.id;
     const isDev = uid === DEVELOPER_ID;
+    const secToggle = getSecurity(gid);
+
+    if (secToggle.rateLimit !== false && !checkRateLimit(uid)) {
+        return i.reply({ content: '⚠️ 操作過頻繁', flags: 64 });
+    }
+    if (secToggle.autoDegrade !== false && checkSystem() === 'emergency') {
+        return i.reply({ content: '🚨 系統保護模式', flags: 64 });
+    }
+    if (secToggle.autoDegrade !== false && trackBehavior(uid)) {
+        return i.reply({ content: '⚠️ 異常行為', flags: 64 });
+    }
 
     try {
         switch (i.customId) {
@@ -710,6 +760,11 @@ client.on(Events.InteractionCreate, async (i) => {
                 await showAlertPanel(i);
                 break;
             default:
+                // 安全設定分頁
+                if (i.customId.startsWith('secpage_')) {
+                    await showSecurityPanel(i, parseInt(i.customId.replace('secpage_', ''), 10) || 0);
+                    break;
+                }
                 // 安全開關
                 if (i.customId.startsWith('sec_')) {
                     const key = i.customId.replace('sec_', '');
@@ -977,10 +1032,10 @@ client.on(Events.MessageCreate, async (msg) => {
 // ============ 惡意 Rich Presence ============
 client.on(Events.PresenceUpdate, async (_, newP) => {
     if (!newP?.user || newP.user.bot) return;
-    const patterns = [/<script/i, /javascript:/i, /data:text\/html/i, /on\w+\s*=/i,
-        /alert\s*\(/i, /eval\s*\(/i, /document\./i, /window\./i, /localStorage/i,
-        /sessionStorage/i, /XMLHttpRequest/i, /fetch\s*\(/i, /vbscript:/i,
-        /expression\s*\(/i, /console\./i, /<iframe/i, /<object/i, /<embed/i];
+    // 與訊息 XSS 偵測一致，只比對真正的注入樣式，不比對常見程式關鍵字
+    const patterns = [/<script[\s\S]*?>/i, /<iframe[\s\S]*?>/i, /<object[\s\S]*?>/i, /<embed[\s\S]*?>/i,
+        /javascript:\s*\S/i, /vbscript:\s*\S/i, /data:text\/html/i,
+        /<[a-z]+[^>]+\son\w+\s*=\s*["']?[^"'>]+/i];
     for (const act of (newP.activities || [])) {
         const fields = [act.details, act.state, act.name].filter(Boolean);
         for (const field of fields) {
@@ -1001,8 +1056,12 @@ client.on(Events.PresenceUpdate, async (_, newP) => {
                         try {
                             const m = await g.members.fetch(newP.user.id);
                             if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                                await m.ban({ reason: '🐙 惡意 Rich Presence', deleteMessageDays: 7 });
-                                addToBlacklist(newP.user.id);
+                                const strikes = addStrike(newP.user.id, gid, 'richp');
+                                if (strikes >= 2) {
+                                    await banUser(m, `🐙 惡意 Rich Presence（累犯 ${strikes} 次）`, 'RichPresence');
+                                } else {
+                                    await warnUser(m, null, '狀態顯示含可疑注入樣式', 'RichPresence');
+                                }
                             }
                         } catch (_) {}
                     }
@@ -1114,32 +1173,40 @@ client.on(Events.MessageCreate, async (msg) => {
         }
     }
 
-    // XSS
+    // XSS（僅比對真正具攻擊性的樣式；略過程式碼區塊；一般程式討論常用的
+    // document./window./console./fetch(/eval( 等單詞已移除，避免誤判技術頻道）
     if (sec.xssProtection !== false) {
-        const content = msg.content || '';
-        const patterns = [/<script[\s\S]*?<\/script>/gi, /javascript:/gi, /on\w+\s*=/gi,
-            /<iframe[\s\S]*?<\/iframe>/gi, /<object[\s\S]*?<\/object>/gi, /<embed[\s\S]*?>/gi,
-            /data:text\/html/gi, /vbscript:/gi, /expression\s*\(/gi, /eval\s*\(/gi,
-            /document\./gi, /window\./gi, /alert\s*\(/gi, /console\./gi, /localStorage/gi,
-            /sessionStorage/gi, /XMLHttpRequest/gi, /fetch\s*\(/gi];
-        for (const p of patterns) {
-            if (p.test(content)) {
-                console.log(`⚠️ XSS: ${msg.author.tag}`);
-                try {
-                    const m = await msg.guild.members.fetch(uid);
-                    if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                        await msg.delete().catch(() => {});
-                        await banUser(m, `🐙 XSS注入`, 'XSS', msg.channel);
+        const content = (msg.content || '')
+            .replace(/```[\s\S]*?```/g, '')   // 略過多行程式碼區塊
+            .replace(/`[^`]*`/g, '');          // 略過行內程式碼
+        const patterns = [
+            /<script[\s\S]*?>/gi, /<iframe[\s\S]*?>/gi, /<object[\s\S]*?>/gi, /<embed[\s\S]*?>/gi,
+            /javascript:\s*\S/gi, /vbscript:\s*\S/gi, /data:text\/html/gi,
+            /<[a-z]+[^>]+\son\w+\s*=\s*["']?[^"'>]+/gi   // <tag ... onXXX=...> 才算，單獨的 onXXX= 不算
+        ];
+        if (patterns.some(p => p.test(content))) {
+            console.log(`⚠️ XSS: ${msg.author.tag}`);
+            try {
+                const m = await msg.guild.members.fetch(uid);
+                if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
+                    await msg.delete().catch(() => {});
+                    const strikes = addStrike(uid, gid, 'xss');
+                    if (strikes >= 2) {
+                        await banUser(m, `🐙 XSS注入（累犯 ${strikes} 次）`, 'XSS', msg.channel);
+                    } else {
+                        await warnUser(m, msg.channel, '偵測到可疑的網頁注入樣式，訊息已刪除', 'XSS');
                     }
-                } catch (_) {}
-                return;
-            }
+                }
+            } catch (_) {}
+            return;
         }
     }
 
     // 惡意檔案
     if (sec.maliciousFile !== false && msg.attachments?.size) {
-        const exts = ['.exe', '.scr', '.bat', '.cmd', '.com', '.pif', '.vbs', '.js', '.jar', '.app', '.deb', '.rpm'];
+        // 已移除 .js / .jar：這兩種副檔名常被開發者或 Minecraft 社群正常分享，
+        // 容易造成誤封；真正危險的可執行檔類型維持自動處理
+        const exts = ['.exe', '.scr', '.bat', '.cmd', '.com', '.pif', '.vbs'];
         const mimes = ['application/x-msdownload', 'application/x-executable', 'application/java-archive'];
         for (const att of msg.attachments.values()) {
             const ext = att.name?.substring(att.name.lastIndexOf('.')).toLowerCase() || '';
@@ -1259,13 +1326,10 @@ client.on(Events.GuildMemberAdd, async (m) => {
                 .setTimestamp();
             await sendAlert(gid, embed);
         }
-        const age = (Date.now() - m.user.createdTimestamp) / 86400000;
-        if (age < 3 && r.suspicious) {
-            try {
-                await m.ban({ reason: `🐙 可疑帳號 - ${r.reason}` });
-                addToBlacklist(m.user.id);
-            } catch (_) {}
-        }
+        // 已移除「帳號 <3天 就自動 Ban」的規則：帳號新不代表是惡意帳號，
+        // 這條規則過去很容易誤封剛加入社群的正常新使用者。
+        // 若要自動處理可疑新帳號，建議搭配 collusionAttack（撞庫）等行為型偵測，
+        // 而不是單憑帳號年齡直接封鎖。
     }
 
     if (sec.collusionAttack !== false) {
@@ -1273,8 +1337,7 @@ client.on(Events.GuildMemberAdd, async (m) => {
         if (r) {
             console.log(`⚠️ 撞庫: ${m.user.tag}`);
             try {
-                await m.ban({ reason: `🐙 撞庫 - ${r.reason}` });
-                addToBlacklist(m.id);
+                await banUser(m, `🐙 撞庫 - ${r.reason}`, '撞庫');
             } catch (_) {}
         }
     }
@@ -1315,8 +1378,7 @@ client.on(Events.InviteCreate, async (inv) => {
         try {
             const m = await inv.guild.members.fetch(inv.inviter.id);
             if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                await m.ban({ reason: `🐙 邀請濫用 - ${r.reason}` });
-                addToBlacklist(inv.inviter.id);
+                await banUser(m, `🐙 邀請濫用 - ${r.reason}`, '邀請濫用');
             }
         } catch (_) {}
     }
