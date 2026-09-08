@@ -108,7 +108,7 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 \* 因 Discord 單則訊息最多 5 列元件、面板按鈕已滿，此項目目前只能透過直接編輯 `config.json` 的
 `securitySettings.<伺服器ID>.honorGlobalBlacklist` 設為 `false` 來關閉，尚未加入面板按鈕。
 
-以上除 `honorGlobalBlacklist` 外皆可在「🛡️ 安全設定」面板中即時切換（分兩頁顯示）。
+以上除 `honorGlobalBlacklist` 外皆可在「🛡️ 安全設定」面板中即時切換（分三頁顯示）。
 
 ---
 
@@ -120,6 +120,7 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 | `blacklist.json` | 全域黑名單，含每筆封鎖的來源伺服器、原因、時間 |
 | `config.json` | 各伺服器的保護/警報開關、白名單、警報頻道、自動回應 |
 | `logs.json` | 操作日誌（Ban 紀錄、警告紀錄、管理員操作紀錄，保留最近30天） |
+| `crash.log` | 當機／未處理錯誤紀錄（V0.2.3 新增，供追查異常重啟原因） |
 | `.env` | 環境變數（Token、開發者ID），**請勿上傳到公開倉庫** |
 | `PRIVACY.md` | 隱私條款 |
 | `start.bat` | Windows 一鍵啟動腳本 |
@@ -136,7 +137,28 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 
 ## :pencil: 更新日誌
 
-### V0.2.2（本次更新）
+### V0.2.3（2026-09-08）
+
+#### 🐛 修復記憶體洩漏（長時間運作記憶體持續增長）
+- 追蹤器（trackers）原本只清理「間隔型」條目，`addStrike`（累犯）、`checkBruteForce`（面板冷卻）、`trackBehavior`（行為追蹤）、`checkRateLimit` 產生的條目會永久殘留，導致記憶體無限增長
+- `cleanupTrackers` 現在會依各類型過期語義逐型清理，並以 2 萬條壓力測試驗證可全數清除
+
+#### 🛡️ 防止隨機崩潰
+- 新增全域錯誤處理（`unhandledRejection`／`uncaughtException`），不再因為單一 Promise 拒絕就靜默退出，並將錯誤寫入 `crash.log` 供追查
+- 登入失敗改為 30 秒後自動重試，不再直接退出
+- 修正 `!章魚` 指令與按鈕互動在特殊情境（無 member 物件）下可能拋例外導致崩潰的問題
+
+#### 🔧 修正失效功能
+- 修正 `autoDegrade`（自動降級）形同虛設的問題：錯誤計數與請求計數原本從未累加，系統永遠不會進入保護模式，現在會正確統計
+
+#### ✨ 其他
+- 修正 `ban()` 使用已棄用的 `deleteMessageDays` 參數（改為 `deleteMessageSeconds`）
+- 補上倉庫遺漏的 `package.json`（新 clone 才能 `npm install`）與 `.gitignore`
+- 清除設定檔中已移除的舊開關 `commandWhitelist` 殘留
+
+---
+
+### V0.2.2（2026-07-29）
 
 #### 🐛 修復誤判/誤封問題
 - XSS 偵測移除常見程式關鍵字誤判，只認真正注入樣式，並略過程式碼區塊

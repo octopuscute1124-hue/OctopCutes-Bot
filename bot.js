@@ -93,7 +93,10 @@ function loadConfig() {
         Object.assign(config.autoResponses, raw.autoResponses || {});
         // 合併安全設定
         for (const [gid, s] of Object.entries(raw.securitySettings || {})) {
-            config.security[gid] = { ...getDefaultSecurity(), ...s };
+            const merged = { ...getDefaultSecurity(), ...s };
+            // 清除已移除的舊開關（V0.2.2 起已不再被程式碼讀取）
+            for (const stale of ['commandWhitelist']) delete merged[stale];
+            config.security[gid] = merged;
         }
         for (const [gid, a] of Object.entries(raw.alertSettings || {})) {
             config.alert[gid] = { ...getDefaultAlert(), ...a };
@@ -184,7 +187,8 @@ function logAdmin(interaction, action, target) {
 // ============ Ban 函數 ============
 async function banUser(member, reason, logReason, channel = null) {
     try {
-        await member.ban({ reason, deleteMessageDays: 7 });
+        // V0.2.3：discord.js v14.14+ 已棄用 deleteMessageDays，改用 deleteMessageSeconds（7 天 = 604800 秒）
+        await member.ban({ reason, deleteMessageSeconds: 604800 });
         if (addToBlacklist(member.id, { reason: logReason, guildId: member.guild.id, guildName: member.guild.name })) {
             console.log(`📋 黑名單: ${member.user.tag}`);
         }
@@ -276,14 +280,50 @@ function checkInterval(trackerKey, maxInterval, timeWindow) {
     return false;
 }
 
+// V0.2.3 記憶體洩漏修復：原本只清理「有 times 陣列」的間隔型追蹤器，
+// 而 addStrike（strike_*）、checkBruteForce（brute_*）、trackBehavior（behavior_*）、
+// checkRateLimit（rl_*）產生的條目永遠不會被刪除，長時間運作會導致記憶體無限增長。
+// 現在依各類型的過期語義逐型清理。
 function cleanupTrackers() {
     const now = Date.now();
     for (const [key, data] of trackers) {
-        if (!data || !data.times) continue;
-        data.times = data.times.filter(t => now - t < 60000);
-        if (data.times.length === 0 && (data.last || 0) + 60000 < now) {
-            trackers.delete(key);
+        if (!data || typeof data !== 'object') { trackers.delete(key); continue; }
+        // 間隔型（checkInterval）：有 times 陣列，逾 60 秒無活動即刪除
+        if (Array.isArray(data.times)) {
+            data.times = data.times.filter(t => now - t < 60000);
+            if (data.times.length === 0 && (data.last || 0) + 60000 < now) {
+                trackers.delete(key);
+            }
+            continue;
         }
+        // 累犯計數（addStrike）：{count, last}，逾 10 分鐘無觸發即刪除（與 10 分鐘累犯窗口一致）
+        if (key.startsWith('strike_')) {
+            if (now - (data.last || 0) > 600000) trackers.delete(key);
+            continue;
+        }
+        // 面板冷卻（checkBruteForce）：{attempts, blocked, until}
+        if (key.startsWith('brute_')) {
+            if (data.blocked) {
+                if (now >= (data.until || 0)) trackers.delete(key);
+            } else {
+                data.attempts = (data.attempts || []).filter(t => now - t < 60000);
+                if (data.attempts.length === 0) trackers.delete(key);
+            }
+            continue;
+        }
+        // 行為追蹤（trackBehavior）：{actions, last}
+        if (key.startsWith('behavior_')) {
+            data.actions = (data.actions || []).filter(t => now - t < 60000);
+            if (data.actions.length === 0 && now - (data.last || 0) > 60000) trackers.delete(key);
+            continue;
+        }
+        // RateLimit（checkRateLimit）：{count, reset}
+        if (key.startsWith('rl_')) {
+            if (now >= (data.reset || 0)) trackers.delete(key);
+            continue;
+        }
+        // 未知型態保險：超過 10 分鐘無更新即刪除
+        if (now - (data.last || 0) > 600000) trackers.delete(key);
     }
 }
 
@@ -406,7 +446,7 @@ async function scanAll() {
 // ============ 主面板 ============
 client.on(Events.MessageCreate, async (msg) => {
     if (msg.author.bot || msg.content.trim() !== '!章魚') return;
-    if (!msg.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (!msg.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
         return msg.reply('❌ 需要管理員權限！');
     }
     if (getSecurity(msg.guildId).bruteForce !== false) {
@@ -681,9 +721,10 @@ async function showAutoPanel(i) {
 // ============ 互動處理 ============
 client.on(Events.InteractionCreate, async (i) => {
     if (!i.isButton()) return;
-    if (!i.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (!i.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
         return i.reply({ content: '❌ 需要管理員權限！', flags: 64 });
     }
+    sysStatus.requests++;
     const gid = i.guildId;
     const uid = i.user.id;
     const isDev = uid === DEVELOPER_ID;
@@ -903,6 +944,7 @@ client.on(Events.InteractionCreate, async (i) => {
                 }
         }
     } catch (e) {
+        sysStatus.errors++;
         console.error('互動錯誤:', e);
         try { await i.reply({ content: '❌ 操作失敗', flags: 64 }); } catch (_) {}
     }
@@ -1010,6 +1052,7 @@ async function showPanelFromInteraction(i) {
             await i.channel.send({ embeds: [embed], components: components });
             await i.reply({ content: '🔄 已重新發送面板', flags: 64 });
         } else {
+            sysStatus.errors++;
             console.error('面板錯誤:', e);
             await i.reply({ content: '❌ 錯誤', flags: 64 }).catch(() => {});
         }
@@ -1079,6 +1122,7 @@ client.on(Events.MessageCreate, async (msg) => {
     if (!gid) return;
     const sec = getSecurity(gid);
     const uid = msg.author.id;
+    sysStatus.requests++;
 
     // 止損
     if (sec.stopLoss !== false && (msg.content.includes('@everyone') || msg.content.includes('@here'))) {
@@ -1447,4 +1491,28 @@ setInterval(async () => {
     await scanAll();
 }, 30 * 60 * 1000);
 
-client.login(process.env.DISCORD_TOKEN);
+// ============ 全域錯誤處理 ============
+// 防止任何單一 Promise 拒絕或未捕捉例外導致整個機器人靜默退出，
+// 並將錯誤寫入 crash.log 以便追查根因。
+function writeCrash(type, err) {
+    const line = `[${new Date().toISOString()}] ${type}: ${err && err.stack ? err.stack : String(err)}\n`;
+    console.error(type === 'uncaughtException' ? '💥' : '🚨', err && err.message ? err.message : err);
+    try { fs.appendFileSync('./crash.log', line); } catch (_) {}
+}
+process.on('unhandledRejection', (reason) => { writeCrash('unhandledRejection', reason); });
+process.on('uncaughtException', (err) => {
+    writeCrash('uncaughtException', err);
+    process.exit(1); // 狀態可能已不一致，交由 systemd 重啟
+});
+
+// ============ 啟動（含登入失敗重試） ============
+async function startBot() {
+    console.log(`🕐 [${new Date().toLocaleString('zh-TW')}] 正在登入 Discord...`);
+    try {
+        await client.login(process.env.DISCORD_TOKEN);
+    } catch (e) {
+        console.error(`🚨 登入失敗: ${e.message}，30 秒後重試`);
+        setTimeout(startBot, 30000);
+    }
+}
+startBot();
