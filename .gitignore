@@ -3,6 +3,7 @@ node_modules/
 crash.log
 nohup.out
 *.bak
+*.corrupt-*
 config.json
 blacklist.json
 logs.json
