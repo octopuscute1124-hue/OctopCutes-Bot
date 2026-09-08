@@ -1,0 +1,10 @@
+{
+  "whitelist": {
+    "users": [],
+    "roles": []
+  },
+  "securitySettings": {},
+  "alertSettings": {},
+  "alertChannelId": {},
+  "autoResponses": {}
+}

@@ -1,4 +1,16 @@
 {
+  "name": "octopcutes-bot",
+  "version": "0.2.4",
+  "description": "OctopCutes Discord 防護機器人（自動安全防護、全域黑名單、控制面板）",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node tests/cleanupTrackers.test.js && node tests/scheduleSave.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
   "dependencies": {
     "discord.js": "^14.27.0",
     "dotenv": "^17.4.2"

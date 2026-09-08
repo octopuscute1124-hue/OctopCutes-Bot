@@ -30,6 +30,8 @@ cd OctopCutes-Bot
 npm install
 ```
 
+首次啟動會自動建立 `config.json`／`blacklist.json`／`logs.json`（執行期資料，不納入版本控制，可參考同目錄的 `*.example.json` 範本）。
+
 需要 [Node.js](https://nodejs.org/) 18 以上版本，以及 `discord.js` v14。
 
 ### 設定
@@ -117,10 +119,12 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 | 檔案 | 說明 |
 |------|------|
 | `bot.js` | 主程式 |
-| `blacklist.json` | 全域黑名單，含每筆封鎖的來源伺服器、原因、時間 |
-| `config.json` | 各伺服器的保護/警報開關、白名單、警報頻道、自動回應 |
-| `logs.json` | 操作日誌（Ban 紀錄、警告紀錄、管理員操作紀錄，保留最近30天） |
+| `blacklist.json` | 全域黑名單（**執行期自動產生**，不納入版本控制，可參考 `blacklist.example.json`） |
+| `config.json` | 各伺服器設定（**執行期自動產生**，不納入版本控制，可參考 `config.example.json`） |
+| `logs.json` | 操作日誌（**執行期自動產生**，不納入版本控制，保留最近30天） |
 | `crash.log` | 當機／未處理錯誤紀錄（V0.2.3 新增，供追查異常重啟原因） |
+| `config.example.json` | 設定檔範本（V0.2.4 新增） |
+| `blacklist.example.json` | 黑名單範本（V0.2.4 新增） |
 | `.env` | 環境變數（Token、開發者ID），**請勿上傳到公開倉庫** |
 | `PRIVACY.md` | 隱私條款 |
 | `start.bat` | Windows 一鍵啟動腳本 |
@@ -136,6 +140,22 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 ---
 
 ## :pencil: 更新日誌
+
+### V0.2.4（2026-09-08）
+
+#### ⚡ 效能與穩定性優化
+- 日誌改為「記憶體緩衝 + 防抖寫入」：不再每次動作都同步讀寫整份 `logs.json`，大幅減少 SD 卡寫入次數與事件迴圈阻塞；`SIGTERM`／`SIGINT`／例外發生時會強制寫出未落盤資料
+- 黑名單改用記憶體快取，避免每次操作重複讀檔
+- `scanAll` 加上重入鎖，防止 30 分鐘定時掃描與啟動掃描重疊
+- 監聽 discord.js 的 `error`／`warn` 事件（未監聽的 `error` 事件會直接讓 Node 崩潰）
+- RateLimit 豁免導覽按鈕（返回／刷新／翻頁），管理員翻頁不會被誤鎖
+- 新增 `tests/scheduleSave.test.js`，與既有測試皆通過（含 2 萬條壓力測試）
+
+#### 🔒 隱私與倉庫整理
+- `config.json`／`blacklist.json`／`logs.json` 移出版本控制（執行期自動產生，避免公開倉庫洩漏伺服器 ID 與封鎖紀錄），新增 `*.example.json` 範本
+- `package.json` 補上名稱、版本、`start`／`test` 腳本與 Node 版本要求
+
+---
 
 ### V0.2.3（2026-09-08）
 

@@ -3,3 +3,7 @@ node_modules/
 crash.log
 nohup.out
 *.bak
+config.json
+blacklist.json
+logs.json
+.DS_Store

@@ -37,8 +37,13 @@ function saveJSON(file, data) {
 }
 
 // ============ 黑名單 ============
-function loadBlacklist() { return loadJSON(BLACKLIST_FILE, { bannedUsers: [] }); }
-function saveBlacklist(data) { saveJSON(BLACKLIST_FILE, data); }
+// V0.2.4：黑名單改用記憶體快取，避免每次操作都重新讀檔；寫入維持同步以確保安全
+let blacklistCache = null;
+function loadBlacklist() {
+    if (!blacklistCache) blacklistCache = loadJSON(BLACKLIST_FILE, { bannedUsers: [], records: {} });
+    return blacklistCache;
+}
+function saveBlacklist(data) { blacklistCache = data; saveJSON(BLACKLIST_FILE, data); }
 
 function addToBlacklist(userId, meta = {}) {
     const data = loadBlacklist();
@@ -164,12 +169,47 @@ async function sendAlert(guildId, embed) {
 }
 
 // ============ 日誌 ============
+// V0.2.4：日誌改為記憶體緩衝 + 防抖寫入（scheduleSave），
+// 避免每次動作都同步讀寫整份檔案，減少 SD 卡寫入次數與事件迴圈阻塞；
+// 程序結束（SIGTERM/SIGINT/例外）前會強制寫出未落盤的資料。
+let logsBuffer = null;
+const pendingWrites = new Map();
+
+function getLogs() {
+    if (!logsBuffer) logsBuffer = loadJSON(LOG_FILE, []);
+    return logsBuffer;
+}
+
+function scheduleSave(file, data, delayMs = 800) {
+    const existing = pendingWrites.get(file);
+    if (existing) { existing.data = data; return; }
+    const timer = setTimeout(() => {
+        // 讀取 map 條目的最新資料（閉包內的 data 是首次呼叫的舊參數）
+        const entry = pendingWrites.get(file);
+        pendingWrites.delete(file);
+        if (!entry) return;
+        try {
+            fs.writeFileSync(file, JSON.stringify(entry.data, null, 2));
+            console.log(`✅ ${file} 已儲存`);
+        } catch (e) { console.error(`儲存 ${file} 失敗:`, e.message); }
+    }, delayMs);
+    pendingWrites.set(file, { data, timer });
+}
+
+function flushPendingWrites() {
+    for (const [file, { data }] of pendingWrites) {
+        try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+        catch (e) { console.error(`寫出 ${file} 失敗:`, e.message); }
+    }
+    pendingWrites.clear();
+}
+
 function logAction(action, details) {
-    let logs = loadJSON(LOG_FILE, []);
+    const logs = getLogs();
     logs.push({ timestamp: new Date().toISOString(), action, details });
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    logs = logs.filter(l => new Date(l.timestamp).getTime() > cutoff).slice(-5000);
-    saveJSON(LOG_FILE, logs);
+    logsBuffer = logs.filter(l => new Date(l.timestamp).getTime() > cutoff).slice(-5000);
+    scheduleSave(LOG_FILE, logsBuffer);
 }
 
 function logAdmin(interaction, action, target) {
@@ -420,27 +460,35 @@ client.once(Events.ClientReady, async (ready) => {
     await scanAll();
 });
 
+let scanning = false;
 async function scanAll() {
-    const blacklist = loadBlacklist();
-    if (blacklist.bannedUsers.length === 0) { console.log('📋 黑名單為空'); return; }
-    console.log(`🔍 掃描 ${client.guilds.cache.size} 個伺服器...`);
-    let total = 0;
-    for (const [, guild] of client.guilds.cache) {
-        if (getSecurity(guild.id).honorGlobalBlacklist === false) {
-            console.log(`⏭️ ${guild.name} 已選擇不套用全域黑名單，略過`);
-            continue;
-        }
-        try {
-            const members = await guild.members.fetch();
-            for (const userId of blacklist.bannedUsers) {
-                const m = members.get(userId);
-                if (m && !m.user.bot) {
-                    if (await banUser(m, '🐙 全域黑名單', '全域掃描')) total++;
-                }
+    // V0.2.4：防止掃描尚未結束就再次觸發（30 分鐘定時與啟動掃描重疊時）
+    if (scanning) return;
+    scanning = true;
+    try {
+        const blacklist = loadBlacklist();
+        if (blacklist.bannedUsers.length === 0) { console.log('📋 黑名單為空'); return; }
+        console.log(`🔍 掃描 ${client.guilds.cache.size} 個伺服器...`);
+        let total = 0;
+        for (const [, guild] of client.guilds.cache) {
+            if (getSecurity(guild.id).honorGlobalBlacklist === false) {
+                console.log(`⏭️ ${guild.name} 已選擇不套用全域黑名單，略過`);
+                continue;
             }
-        } catch (e) { console.log(`⚠️ ${guild.name}: ${e.message}`); }
+            try {
+                const members = await guild.members.fetch();
+                for (const userId of blacklist.bannedUsers) {
+                    const m = members.get(userId);
+                    if (m && !m.user.bot) {
+                        if (await banUser(m, '🐙 全域黑名單', '全域掃描')) total++;
+                    }
+                }
+            } catch (e) { console.log(`⚠️ ${guild.name}: ${e.message}`); }
+        }
+        console.log(`✅ 共封鎖 ${total} 人`);
+    } finally {
+        scanning = false;
     }
-    console.log(`✅ 共封鎖 ${total} 人`);
 }
 
 // ============ 主面板 ============
@@ -730,7 +778,9 @@ client.on(Events.InteractionCreate, async (i) => {
     const isDev = uid === DEVELOPER_ID;
     const secToggle = getSecurity(gid);
 
-    if (secToggle.rateLimit !== false && !checkRateLimit(uid)) {
+    // V0.2.4：導覽類按鈕（返回/刷新/翻頁）不計入 RateLimit，避免管理員翻頁被誤鎖
+    const isNav = i.customId === 'back' || i.customId === 'refresh' || i.customId.startsWith('secpage_');
+    if (secToggle.rateLimit !== false && !isNav && !checkRateLimit(uid)) {
         return i.reply({ content: '⚠️ 操作過頻繁', flags: 64 });
     }
     if (secToggle.autoDegrade !== false && checkSystem() === 'emergency') {
@@ -1502,8 +1552,15 @@ function writeCrash(type, err) {
 process.on('unhandledRejection', (reason) => { writeCrash('unhandledRejection', reason); });
 process.on('uncaughtException', (err) => {
     writeCrash('uncaughtException', err);
+    flushPendingWrites();
     process.exit(1); // 狀態可能已不一致，交由 systemd 重啟
 });
+// V0.2.4：監聽 discord.js 的 error/warn 事件（未監聽的 error 事件會直接讓 Node 崩潰）
+client.on('error', (e) => writeCrash('clientError', e));
+client.on('warn', (w) => console.warn('⚠️', w && w.message ? w.message : w));
+// V0.2.4：停止前強制寫出未落盤的日誌緩衝，避免資料遺失
+process.on('SIGTERM', () => { flushPendingWrites(); process.exit(0); });
+process.on('SIGINT', () => { flushPendingWrites(); process.exit(0); });
 
 // ============ 啟動（含登入失敗重試） ============
 async function startBot() {
