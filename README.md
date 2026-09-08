@@ -141,6 +141,38 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 
 ## :pencil: 更新日誌
 
+### V0.2.5（2026-09-09）— 安全強化與防駭客功能（力大磚飛）
+
+#### 🎣 詐騙連結攔截（新增安全開關：scamLink）
+- 內建常見詐騙／釣魚域名黑名單（discord-nitro、discordgift、steamgift、netflix-gift 等 26 組），命中即刪訊息＋警告，10 分鐘內累犯第 2 次自動封鎖
+- 偽官方域名偵測：域名含 discord／steam／nitro 關鍵字但非官方域名（如 discord.com.evil.com）一律視為可疑
+- IP 直連連結偵測（http://123.45.67.89/... 通常是惡意）
+- 官方域名白名單（discord、GitHub、YouTube 等 50+ 組，含子域）確保不會誤封正常分享
+
+#### 🔁 重複內容偵測（新增安全開關：duplicateSpam）
+- 同一使用者 30 秒內發送 ≥5 條內容相同（前 100 字元）的訊息即觸發，警告後累犯封鎖，專打刷屏機器人
+
+#### 🎭 假冒名稱偵測（新增安全開關：impersonation）
+- 新成員名稱含 discord／steam／nitro ＋ 贈禮／官方關鍵字組合（如「discord nitro gift」）時發出警報
+
+#### 🛑 緊急停機（僅開發者）
+- 開發者輸入 !章魚 停止 可遠端關閉機器人（先寫出未落盤日誌再退出），機器人失控時可立即止血
+
+#### 🛡️ 自我防護
+- 設定檔損壞自動備份：config.json／blacklist.json／logs.json 若被竄改或手動誤改導致 JSON 損壞，自動備份為 .corrupt-<時間戳> 再以預設值重啟，不讓壞檔弄掛機器人
+- blacklist.json 結構保險：即使 JSON 合法但結構不完整也不會崩潰
+- 啟動前驗證 .env：缺少或長度異常的 DISCORD_TOKEN 直接明確報錯退出，不再無限重試
+- 偵測機器人被移出伺服器（GuildDelete）並記錄；加入新伺服器（GuildCreate）時自動建立預設設定並立即套用全域黑名單
+
+#### 🔒 操作安全
+- 面板輸入互斥鎖：同一使用者同時只能有一個「等待輸入」流程，防止重複點擊按鈕導致多個 awaitMessages 疊加干擾
+- 自動回應防注入：設定回應時禁止 @everyone／@here，回應長度上限 1900 字元
+
+#### 🧪 測試
+- 新增 tests/scamLink.test.js（URL 提取、詐騙／偽官方／IP 直連判定、假冒名稱 27 項）與 tests/duplicateSpam.test.js（重複觸發、窗口重置、cleanup 清理 9 項），連同既有測試全部通過
+
+---
+
 ### V0.2.4（2026-09-08）
 
 #### ⚡ 效能與穩定性優化

@@ -23,8 +23,21 @@ const LOG_FILE = './logs.json';
 // ============ 工具函數 ============
 function loadJSON(file, fallback) {
     try {
-        if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch (e) { console.error(`讀取 ${file} 失敗:`, e.message); }
+        if (fs.existsSync(file)) {
+            const raw = fs.readFileSync(file, 'utf8');
+            const data = JSON.parse(raw);
+            if (typeof data !== 'object' || data === null) throw new Error('JSON 根節點非物件');
+            return data;
+        }
+    } catch (e) {
+        console.error(`讀取 ${file} 失敗:`, e.message);
+        // V0.2.5：損壞的設定檔自動備份為 .corrupt-<時間戳>，避免被竄改或手動誤改後資料永久遺失
+        try {
+            const bak = `${file}.corrupt-${Date.now()}`;
+            fs.copyFileSync(file, bak);
+            console.warn(`⚠️ 已備份損壞檔案: ${bak}`);
+        } catch (_) {}
+    }
     return fallback;
 }
 
@@ -40,7 +53,13 @@ function saveJSON(file, data) {
 // V0.2.4：黑名單改用記憶體快取，避免每次操作都重新讀檔；寫入維持同步以確保安全
 let blacklistCache = null;
 function loadBlacklist() {
-    if (!blacklistCache) blacklistCache = loadJSON(BLACKLIST_FILE, { bannedUsers: [], records: {} });
+    if (!blacklistCache) {
+        const d = loadJSON(BLACKLIST_FILE, { bannedUsers: [], records: {} });
+        // V0.2.5：結構保險——即使 JSON 合法但結構不完整也不會崩潰
+        if (!Array.isArray(d.bannedUsers)) d.bannedUsers = [];
+        if (!d.records || typeof d.records !== 'object') d.records = {};
+        blacklistCache = d;
+    }
     return blacklistCache;
 }
 function saveBlacklist(data) { blacklistCache = data; saveJSON(BLACKLIST_FILE, data); }
@@ -79,7 +98,9 @@ function getDefaultSecurity() {
         permissionSpam: true, maliciousFile: true, xssProtection: true, richPresence: true,
         crawlerDetection: true, collusionAttack: true, suspiciousAccount: true, bruteForce: true,
         rateLimit: true, autoDegrade: true, inviteMonitor: true,
-        roleLock: true, channelSpam: true, honorGlobalBlacklist: true, logRetention: 30
+        roleLock: true, channelSpam: true, honorGlobalBlacklist: true, logRetention: 30,
+        // V0.2.5 新增：詐騙連結攔截 / 重複內容偵測 / 假冒名稱偵測
+        scamLink: true, duplicateSpam: true, impersonation: true
     };
 }
 
@@ -362,6 +383,12 @@ function cleanupTrackers() {
             if (now >= (data.reset || 0)) trackers.delete(key);
             continue;
         }
+        // 重複內容（checkDuplicate）：{msgs:[{t,h}], last}，逾 60 秒無活動刪除
+        if (key.startsWith('dup_')) {
+            data.msgs = (data.msgs || []).filter(m => now - (m && m.t) < 30000);
+            if (data.msgs.length === 0 && now - (data.last || 0) > 60000) trackers.delete(key);
+            continue;
+        }
         // 未知型態保險：超過 10 分鐘無更新即刪除
         if (now - (data.last || 0) > 600000) trackers.delete(key);
     }
@@ -390,6 +417,80 @@ function isSuspicious(user) {
     if (age < 7) return { suspicious: true, reason: `帳號 < 7 天 (${Math.round(age)}天)` };
     if (age < 30 && !user.avatar) return { suspicious: true, reason: `< 30天無頭像` };
     return { suspicious: false };
+}
+
+// ============ V0.2.5 詐騙連結攔截 ============
+// 力大磚飛：內建常見詐騙/釣魚域名黑名單 + 偽官方域名偵測 + IP 直連偵測
+const SCAM_DOMAINS = [
+    'discord-nitro', 'discordnitro', 'discordgift', 'discord.gift', 'free-nitro',
+    'nitro-gift', 'nitrogift', 'nitro-free', 'nitro-giveaway', 'discord-airdrop',
+    'discord-free', 'discord-verify', 'discord-verification', 'discord-mod',
+    'discord-staff', 'discord-support', 'discord-safety', 'steam-gift', 'steamgift',
+    'steam-codes', 'steamcodes', 'steam-free', 'netflix-gift', 'netflixgift',
+    'giveaway-nitro', 'free-gift'
+];
+const OFFICIAL_DOMAINS = [
+    'discord.com', 'discord.gg', 'discordapp.com', 'discord.js.org', 'discordjs.guide',
+    'discordpy.readthedocs.io', 'steampowered.com', 'steamcommunity.com', 'github.com',
+    'github.io', 'gitlab.com', 'youtube.com', 'youtu.be', 'twitch.tv', 'twitter.com',
+    'x.com', 'facebook.com', 'instagram.com', 'tiktok.com', 'reddit.com', 'medium.com',
+    'notion.so', 'google.com', 'docs.google.com', 'drive.google.com', 'microsoft.com',
+    'apple.com', 'spotify.com', 'netflix.com', 'amazon.com', 'paypal.com', 'wikipedia.org',
+    'stackoverflow.com', 'stackexchange.com', 'npmjs.com', 'nodejs.org', 'python.org',
+    'mozilla.org', 'cloudflare.com', 'vercel.com', 'netlify.com', 'replit.com', 'glitch.com',
+    'codepen.io', 'jsfiddle.net', 'play.google.com', 'apps.apple.com', 'roblox.com',
+    'minecraft.net', 'epicgames.com', 'xbox.com', 'playstation.com', 'nintendo.com'
+];
+
+function extractUrls(content) {
+    const re = /https?:\/\/[^\s<>"']+/gi;
+    return (content.match(re) || []).map(u => u.replace(/[),.;!?]+$/, ''));
+}
+
+function getScamReason(url) {
+    try {
+        const u = new URL(url);
+        const host = u.hostname.toLowerCase();
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return 'IP 直連連結';
+        const isOfficial = OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o));
+        if (isOfficial) return null;
+        for (const s of SCAM_DOMAINS) {
+            if (host.includes(s)) return `詐騙域名 (${host})`;
+        }
+        if (/(discord|steam|nitro)/.test(host)) return `疑似偽裝官方連結 (${host})`;
+        return null;
+    } catch (_) { return null; }
+}
+
+// ============ V0.2.5 重複內容偵測 ============
+// 同一使用者 30 秒內發送 ≥5 條內容相同（前 100 字元）的訊息即觸發
+function checkDuplicate(userId, guildId, content) {
+    const key = `dup_${userId}_${guildId}`;
+    const now = Date.now();
+    const hash = (content || '').slice(0, 100);
+    if (!trackers.has(key)) trackers.set(key, { msgs: [], last: now });
+    const d = trackers.get(key);
+    d.msgs = d.msgs.filter(m => now - m.t < 30000);
+    d.msgs.push({ t: now, h: hash });
+    d.last = now;
+    const same = d.msgs.filter(m => m.h === hash).length;
+    return same >= 5 ? { triggered: true, count: same } : false;
+}
+
+// ============ V0.2.5 假冒名稱偵測 ============
+// 名稱含 discord/steam/nitro + 贈禮/官方關鍵字組合時回傳原因字串，否則 null
+function isImpersonating(user) {
+    const name = ((user && (user.username || user.globalName)) || '').toLowerCase();
+    const patterns = [
+        [/discord\s*(nitro|gift|giveaway|free|airdrop|mod|staff|admin|support|system|verify|verification)/, '名稱含 discord+官方/贈禮關鍵字'],
+        [/nitro\s*(gift|free|giveaway)/, '名稱含 nitro+贈禮關鍵字'],
+        [/steam\s*(gift|free|giveaway|codes?)/, '名稱含 steam+贈禮關鍵字'],
+        [/(free|gift)\s*(nitro|steam|discord)/, '名稱含免費贈禮關鍵字']
+    ];
+    for (const [p, reason] of patterns) {
+        if (p.test(name)) return reason;
+    }
+    return null;
 }
 
 function checkBruteForce(userId) {
@@ -493,7 +594,17 @@ async function scanAll() {
 
 // ============ 主面板 ============
 client.on(Events.MessageCreate, async (msg) => {
-    if (msg.author.bot || msg.content.trim() !== '!章魚') return;
+    if (msg.author.bot) return;
+    // V0.2.5：緊急停機（僅開發者）——機器人失控時可遠端關閉
+    if (msg.content.trim() === '!章魚 停止') {
+        if (msg.author.id !== DEVELOPER_ID) return msg.reply('❌ 僅開發者');
+        await msg.reply('🛑 緊急停機中，再見！');
+        logAction('EMERGENCY_STOP', { userId: msg.author.id, tag: msg.author.tag });
+        flushPendingWrites();
+        setTimeout(() => { client.destroy(); process.exit(0); }, 500);
+        return;
+    }
+    if (msg.content.trim() !== '!章魚') return;
     if (!msg.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
         return msg.reply('❌ 需要管理員權限！');
     }
@@ -579,7 +690,9 @@ const SECURITY_FEATURES = [
     ['maliciousFile', '惡意檔案'], ['xssProtection', 'XSS'], ['richPresence', 'RichP'],
     ['crawlerDetection', '爬蟲'], ['collusionAttack', '撞庫'], ['suspiciousAccount', '可疑帳號'],
     ['bruteForce', '面板冷卻'], ['rateLimit', 'RateLimit'], ['autoDegrade', '降級'],
-    ['inviteMonitor', '邀請'], ['roleLock', '角色鎖定'], ['channelSpam', '頻道監控']
+    ['inviteMonitor', '邀請'], ['roleLock', '角色鎖定'], ['channelSpam', '頻道監控'],
+    // V0.2.5 新增
+    ['scamLink', '詐騙連結'], ['duplicateSpam', '重複內容'], ['impersonation', '假冒名稱']
 ];
 const SEC_PAGE_SIZE = 10;
 
@@ -831,6 +944,8 @@ client.on(Events.InteractionCreate, async (i) => {
                 });
                 break;
             case 'set_alert_ch':
+                if (!tryAcquirePrompt(uid)) return i.reply({ content: '⚠️ 已有進行中的操作，請先完成或等待超時', flags: 64 });
+                try {
                 await i.reply({ content: '📢 請輸入頻道 ID：', flags: 64 });
                 const collected = await i.channel.awaitMessages({
                     filter: m => m.author.id === uid,
@@ -849,6 +964,9 @@ client.on(Events.InteractionCreate, async (i) => {
                 logAdmin(i, '設定警報頻道', `#${ch.name}`);
                 await i.followUp({ content: `✅ 已設定 <#${cid}>`, flags: 64 });
                 await showAlertPanel(i);
+                } finally {
+                    releasePrompt(uid);
+                }
                 break;
             default:
                 // 安全設定分頁
@@ -883,6 +1001,8 @@ client.on(Events.InteractionCreate, async (i) => {
                     const action = i.customId.includes('add') ? 'add' : 'remove';
                     const isRole = i.customId.includes('role');
                     const label = isRole ? '角色 ID' : '使用者 ID';
+                    if (!tryAcquirePrompt(uid)) return i.reply({ content: '⚠️ 已有進行中的操作，請先完成或等待超時', flags: 64 });
+                    try {
                     await i.reply({ content: `📝 請輸入${label}：`, flags: 64 });
                     const coll = await i.channel.awaitMessages({
                         filter: m => m.author.id === uid,
@@ -936,11 +1056,16 @@ client.on(Events.InteractionCreate, async (i) => {
                         await i.followUp({ content: `⚠️ 操作失敗，可能已存在或不存在`, flags: 64 });
                     }
                     await showManagePanel(i, type === 'bl' ? 'bl' : 'wl');
+                    } finally {
+                        releasePrompt(uid);
+                    }
                     break;
                 }
                 // 自動回應
                 if (i.customId === 'auto_add' || i.customId === 'auto_remove') {
                     if (!isDev) return i.reply({ content: '❌ 僅開發者', flags: 64 });
+                    if (!tryAcquirePrompt(uid)) return i.reply({ content: '⚠️ 已有進行中的操作，請先完成或等待超時', flags: 64 });
+                    try {
                     if (i.customId === 'auto_add') {
                         await i.reply({ content: '📝 格式：`觸發詞 | 回應`', flags: 64 });
                         const coll = await i.channel.awaitMessages({
@@ -956,6 +1081,9 @@ client.on(Events.InteractionCreate, async (i) => {
                         const trigger = parts[0];
                         const response = parts.slice(1).join('|').trim();
                         if (!trigger || !response) return i.followUp({ content: '❌ 不能為空', flags: 64 });
+                        // V0.2.5：自動回應防注入——禁止 @everyone/@here，限制回應長度
+                        if (/@everyone|@here/i.test(response)) return i.followUp({ content: '❌ 回應不得包含 @everyone/@here', flags: 64 });
+                        if (response.length > 1900) return i.followUp({ content: '❌ 回應過長（上限 1900 字元）', flags: 64 });
                         if (!config.autoResponses[gid]) config.autoResponses[gid] = {};
                         config.autoResponses[gid][trigger] = response;
                         saveConfig();
@@ -990,6 +1118,9 @@ client.on(Events.InteractionCreate, async (i) => {
                         await i.followUp({ content: `✅ 已移除：\`${removed}\``, flags: 64 });
                         await showAutoPanel(i);
                     }
+                    } finally {
+                        releasePrompt(uid);
+                    }
                     break;
                 }
         }
@@ -999,6 +1130,16 @@ client.on(Events.InteractionCreate, async (i) => {
         try { await i.reply({ content: '❌ 操作失敗', flags: 64 }); } catch (_) {}
     }
 });
+
+// V0.2.5：面板輸入互斥鎖——同一使用者同時只能有一個「等待輸入」流程，
+// 防止重複點擊按鈕導致多個 awaitMessages 疊加互相干擾
+const pendingPrompts = new Map();
+function tryAcquirePrompt(userId) {
+    if (pendingPrompts.get(userId)) return false;
+    pendingPrompts.set(userId, true);
+    return true;
+}
+function releasePrompt(userId) { pendingPrompts.delete(userId); }
 
 async function showPanelFromInteraction(i) {
     try {
@@ -1253,6 +1394,47 @@ client.on(Events.MessageCreate, async (msg) => {
         }
     }
 
+    // 詐騙連結（V0.2.5）
+    if (sec.scamLink !== false) {
+        const urls = extractUrls(msg.content || '');
+        const hit = urls.map(u => ({ url: u, reason: getScamReason(u) })).find(x => x.reason);
+        if (hit) {
+            console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
+            try {
+                const m = await msg.guild.members.fetch(uid);
+                if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
+                    await msg.delete().catch(() => {});
+                    const strikes = addStrike(uid, gid, 'scam');
+                    if (strikes >= 2) {
+                        await banUser(m, `🐙 詐騙連結（累犯 ${strikes} 次）`, '詐騙連結', msg.channel);
+                    } else {
+                        await warnUser(m, msg.channel, `偵測到可疑連結：${hit.reason}，訊息已刪除`, '詐騙連結');
+                    }
+                }
+            } catch (_) {}
+            return;
+        }
+    }
+
+    // 重複內容（V0.2.5）
+    if (sec.duplicateSpam !== false) {
+        const d = checkDuplicate(uid, gid, msg.content);
+        if (d) {
+            console.log(`⚠️ 重複內容: ${msg.author.tag} (${d.count}次/30秒)`);
+            try {
+                const m = await msg.guild.members.fetch(uid);
+                if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
+                    const strikes = addStrike(uid, gid, 'dup');
+                    if (strikes >= 2) {
+                        await banUser(m, `🐙 重複內容（累犯 ${strikes} 次）`, '重複內容', msg.channel);
+                    } else {
+                        await warnUser(m, msg.channel, '短時間內重複發送相同內容', '重複內容');
+                    }
+                }
+            } catch (_) {}
+        }
+    }
+
     // 爬蟲
     if (sec.crawlerDetection !== false) {
         const r = DETECT.crawler(uid, gid);
@@ -1401,6 +1583,19 @@ client.on(Events.ChannelUpdate, async (old, now) => {
     }
 });
 
+// ============ 伺服器加入/離開（V0.2.5）============
+client.on(Events.GuildCreate, async (guild) => {
+    console.log(`✅ 加入新伺服器: ${guild.name}`);
+    getSecurity(guild.id); // 建立預設安全設定
+    saveConfig();
+    await scanAll(); // 立即套用全域黑名單
+});
+
+client.on(Events.GuildDelete, (guild) => {
+    console.warn(`🚫 已離開伺服器: ${guild.name || guild.id}（可能被移除或機器人被踢）`);
+    logAction('GUILD_LEFT', { guildId: guild.id, guildName: guild.name || '未知' });
+});
+
 // ============ 成員加入 ============
 client.on(Events.GuildMemberAdd, async (m) => {
     const gid = m.guild.id;
@@ -1424,6 +1619,20 @@ client.on(Events.GuildMemberAdd, async (m) => {
         // 這條規則過去很容易誤封剛加入社群的正常新使用者。
         // 若要自動處理可疑新帳號，建議搭配 collusionAttack（撞庫）等行為型偵測，
         // 而不是單憑帳號年齡直接封鎖。
+    }
+
+    // V0.2.5：假冒名稱偵測（名稱含 discord/steam+贈禮關鍵字組合）
+    if (sec.impersonation !== false) {
+        const imp = isImpersonating(m.user);
+        if (imp && isAlertEnabled(gid, 'suspiciousAccount')) {
+            const embed = new EmbedBuilder()
+                .setColor(0xffaa00)
+                .setTitle('⚠️ 疑似假冒帳號')
+                .setDescription(`**${m.user.tag}** 名稱疑似假冒官方或贈禮帳號`)
+                .addFields({ name: '原因', value: imp, inline: false })
+                .setTimestamp();
+            await sendAlert(gid, embed);
+        }
     }
 
     if (sec.collusionAttack !== false) {
@@ -1563,6 +1772,19 @@ process.on('SIGTERM', () => { flushPendingWrites(); process.exit(0); });
 process.on('SIGINT', () => { flushPendingWrites(); process.exit(0); });
 
 // ============ 啟動（含登入失敗重試） ============
+// V0.2.5：啟動前驗證環境設定，避免缺少 token 時無限重試循環
+function validateEnv() {
+    if (!process.env.DISCORD_TOKEN) {
+        console.error('❌ 缺少 DISCORD_TOKEN（請檢查 .env 檔案）');
+        return false;
+    }
+    if (process.env.DISCORD_TOKEN.length < 30) {
+        console.error('❌ DISCORD_TOKEN 格式異常（長度過短，請檢查 .env 檔案）');
+        return false;
+    }
+    return true;
+}
+
 async function startBot() {
     console.log(`🕐 [${new Date().toLocaleString('zh-TW')}] 正在登入 Discord...`);
     try {
@@ -1572,4 +1794,5 @@ async function startBot() {
         setTimeout(startBot, 30000);
     }
 }
+if (!validateEnv()) process.exit(1);
 startBot();
