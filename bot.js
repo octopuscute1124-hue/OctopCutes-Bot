@@ -60,6 +60,8 @@ function loadBlacklist() {
         if (!d.records || typeof d.records !== 'object') d.records = {};
         // V0.2.6：管理員自訂詐騙域名清單
         if (!Array.isArray(d.scamDomains)) d.scamDomains = [];
+        // V0.2.7：詐騙域名學習紀錄（回報次數/命中次數/來源）
+        if (!d.scamDomainMeta || typeof d.scamDomainMeta !== 'object') d.scamDomainMeta = {};
         blacklistCache = d;
     }
     return blacklistCache;
@@ -539,6 +541,45 @@ async function checkImposterBots() {
     return found;
 }
 
+// ============ V0.2.7 詐騙域名自主學習（輕量規則式，無需 ML） ============
+// 1) 偽官方域名（discord/steam/nitro 但非官方）被不同訊息命中 ≥3 次 → 自動提升為明確詐騙域名
+// 2) 自訂域名加入超過 14 天仍零命中 → 低置信，自動移除
+const scamHitStats = new Map();
+function learnScamDomains() {
+    const bl = loadBlacklist();
+    bl.scamDomains = bl.scamDomains || [];
+    bl.scamDomainMeta = bl.scamDomainMeta || {};
+    const now = Date.now();
+    let learned = 0, removed = 0;
+    // 1) 自動提升
+    for (const [host, st] of scamHitStats) {
+        if (st.count >= 3 && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
+            bl.scamDomains.push(host);
+            bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now };
+            logAction('SCAM_LEARN', { domain: host, reports: st.count });
+            console.log(`🧠 自主學習: ${host} 被命中 ${st.count} 次，已加入詐騙域名`);
+            learned++;
+        }
+    }
+    // 2) 低置信移除
+    for (const d of [...bl.scamDomains]) {
+        const meta = bl.scamDomainMeta[d];
+        if (meta && meta.addedAt && now - meta.addedAt > 14 * 24 * 60 * 60 * 1000 && !(meta.hits > 0)) {
+            bl.scamDomains = bl.scamDomains.filter(x => x !== d);
+            delete bl.scamDomainMeta[d];
+            logAction('SCAM_FORGET', { domain: d });
+            console.log(`🧠 自主學習: ${d} 14 天零命中，已移除（低置信）`);
+            removed++;
+        }
+    }
+    scamHitStats.clear();
+    if (learned || removed) saveBlacklist(bl);
+    console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}`);
+    return { learned, removed };
+}
+// 每 24 小時執行一次學習回合
+setInterval(() => { try { learnScamDomains(); } catch (e) { console.error('學習失敗:', e.message); } }, 24 * 60 * 60 * 1000);
+
 function checkBruteForce(userId) {
     const key = `brute_${userId}`;
     const now = Date.now();
@@ -653,39 +694,11 @@ async function scanAll() {
 // ============ 主面板 ============
 client.on(Events.MessageCreate, async (msg) => {
     if (msg.author.bot) return;
-    // V0.2.5：緊急停機（僅開發者）——機器人失控時可遠端關閉
-    if (msg.content.trim() === '!章魚 停止') {
-        if (msg.author.id !== DEVELOPER_ID) return msg.reply('❌ 僅開發者');
-        await msg.reply('🛑 緊急停機中，再見！');
-        logAction('EMERGENCY_STOP', { userId: msg.author.id, tag: msg.author.tag });
-        flushPendingWrites();
-        setTimeout(() => { client.destroy(); process.exit(0); }, 500);
+    // V0.2.7：指令收斂——所有操作統一由面板 UI 完成，!章魚 僅作為入口
+    if (msg.content.trim() !== '!章魚') {
+        if (msg.content.trim().startsWith('!章魚 ')) return msg.reply('💡 所有操作已整合到控制面板，請直接輸入 `!章魚` 開啟');
         return;
     }
-    // V0.2.6：自訂詐騙域名管理（管理員）
-    const scamAdd = msg.content.trim().match(/^!章魚 加詐騙域名\s+([^\s]+)\s*$/);
-    const scamDel = msg.content.trim().match(/^!章魚 刪詐騙域名\s+([^\s]+)\s*$/);
-    if (scamAdd || scamDel) {
-        if (!msg.member?.permissions?.has(PermissionFlagsBits.Administrator)) return msg.reply('❌ 需要管理員權限！');
-        const domain = (scamAdd ? scamAdd[1] : scamDel[1]).toLowerCase();
-        if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain)) return msg.reply('❌ 網域格式無效（範例：evil-example.com）');
-        const bl = loadBlacklist();
-        bl.scamDomains = bl.scamDomains || [];
-        if (scamAdd) {
-            if (bl.scamDomains.includes(domain)) return msg.reply(`ℹ️ \`${domain}\` 已在自訂詐騙域名清單`);
-            bl.scamDomains.push(domain);
-            saveBlacklist(bl);
-            logAction('SCAM_DOMAIN_ADD', { adminId: msg.author.id, adminTag: msg.author.tag, guildId: msg.guildId, domain });
-            return msg.reply(`✅ 已加入自訂詐騙域名：\`${domain}\``);
-        } else {
-            if (!bl.scamDomains.includes(domain)) return msg.reply(`ℹ️ \`${domain}\` 不在自訂詐騙域名清單`);
-            bl.scamDomains = bl.scamDomains.filter(d => d !== domain);
-            saveBlacklist(bl);
-            logAction('SCAM_DOMAIN_REMOVE', { adminId: msg.author.id, adminTag: msg.author.tag, guildId: msg.guildId, domain });
-            return msg.reply(`✅ 已移除自訂詐騙域名：\`${domain}\``);
-        }
-    }
-    if (msg.content.trim() !== '!章魚') return;
     if (!msg.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
         return msg.reply('❌ 需要管理員權限！');
     }
@@ -728,7 +741,8 @@ async function showPanel(msg) {
         .addComponents(
             new ButtonBuilder().setCustomId('sec').setLabel('🛡️ 安全設定').setStyle(3),
             new ButtonBuilder().setCustomId('alert').setLabel('🔔 警報設定').setStyle(2),
-            new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2)
+            new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2),
+            new ButtonBuilder().setCustomId('scam').setLabel('🌐 詐騙域名').setStyle(1)
         );
 
     const row2 = new ActionRowBuilder();
@@ -737,7 +751,8 @@ async function showPanel(msg) {
             new ButtonBuilder().setCustomId('bl').setLabel('📋 黑名單').setStyle(4),
             new ButtonBuilder().setCustomId('wl').setLabel('👑 白名單').setStyle(3),
             new ButtonBuilder().setCustomId('auto').setLabel('💬 自動回應').setStyle(1),
-            new ButtonBuilder().setCustomId('export').setLabel('📤 匯出').setStyle(3)
+            new ButtonBuilder().setCustomId('export').setLabel('📤 匯出').setStyle(3),
+            new ButtonBuilder().setCustomId('stop').setLabel('🛑 緊急停機').setStyle(4)
         );
     }
 
@@ -962,6 +977,39 @@ async function showAutoPanel(i) {
     await i.reply({ embeds: [embed], components: [row], flags: 64 });
 }
 
+// ============ 詐騙域名面板（V0.2.7） ============
+async function showScamPanel(i) {
+    const bl = loadBlacklist();
+    const domains = bl.scamDomains || [];
+    const meta = bl.scamDomainMeta || {};
+    const field = domains.length ? domains.slice(0, 15).map(d => {
+        const m = meta[d] || {};
+        const tags = [];
+        if (m.reports) tags.push(`回報 ${m.reports} 次`);
+        if (m.hits) tags.push(`命中 ${m.hits} 次`);
+        if (m.source) tags.push(m.source);
+        return `🛡️ \`${d}\`${tags.length ? '（' + tags.join('・') + '）' : ''}`;
+    }).join('\n') + (domains.length > 15 ? `\n... 共 ${domains.length} 個` : '') : '⚠️ 尚無自訂詐騙域名';
+    const embed = new EmbedBuilder()
+        .setColor(0xff6b6b)
+        .setTitle('🌐 詐騙域名（自主學習）')
+        .addFields({ name: '📋 自訂清單', value: field, inline: false })
+        .setDescription('回報可疑連結後機器人會自主學習；官方網站無法被加入，14 天零命中的低置信域名會被自動移除')
+        .setFooter({ text: '管理員可回報/新增/刪除' })
+        .setTimestamp();
+    const row1 = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder().setCustomId('scam_report').setLabel('📩 回報詐騙連結').setStyle(3),
+            new ButtonBuilder().setCustomId('scam_add').setLabel('➕ 新增域名').setStyle(1),
+            new ButtonBuilder().setCustomId('scam_remove').setLabel('➖ 刪除域名').setStyle(4)
+        );
+    const row2 = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder().setCustomId('back').setLabel('🔙 返回').setStyle(2)
+        );
+    await i.reply({ embeds: [embed], components: [row1, row2], flags: 64 });
+}
+
 // ============ 互動處理 ============
 client.on(Events.InteractionCreate, async (i) => {
     if (!i.isButton()) return;
@@ -1009,6 +1057,16 @@ client.on(Events.InteractionCreate, async (i) => {
                 break;
             case 'auto':
                 await showAutoPanel(i);
+                break;
+            case 'scam':
+                await showScamPanel(i);
+                break;
+            case 'stop':
+                if (!isDev) return i.reply({ content: '❌ 僅開發者', flags: 64 });
+                await i.reply({ content: '🛑 緊急停機中，再見！', flags: 64 });
+                logAction('EMERGENCY_STOP', { userId: uid, tag: i.user.tag, source: '面板' });
+                flushPendingWrites();
+                setTimeout(() => { client.destroy(); process.exit(0); }, 500);
                 break;
             case 'export':
                 if (!isDev) return i.reply({ content: '❌ 僅開發者', flags: 64 });
@@ -1144,6 +1202,62 @@ client.on(Events.InteractionCreate, async (i) => {
                     }
                     break;
                 }
+                // 詐騙域名回報/新增/刪除（V0.2.7 自主學習）
+                if (['scam_report', 'scam_add', 'scam_remove'].includes(i.customId)) {
+                    if (!tryAcquirePrompt(uid)) return i.reply({ content: '⚠️ 已有進行中的操作，請先完成或等待超時', flags: 64 });
+                    try {
+                    const blNow = loadBlacklist();
+                    blNow.scamDomains = blNow.scamDomains || [];
+                    blNow.scamDomainMeta = blNow.scamDomainMeta || {};
+                    const promptText = i.customId === 'scam_report'
+                        ? '📩 請貼上可疑的詐騙連結（含 http）：'
+                        : i.customId === 'scam_add'
+                            ? '📝 請輸入要新增的詐騙域名（範例：evil-example.com）：'
+                            : '📝 請輸入要刪除的詐騙域名：';
+                    await i.reply({ content: promptText, flags: 64 });
+                    const coll = await i.channel.awaitMessages({ filter: m => m.author.id === uid, max: 1, time: 60000 });
+                    if (!coll.size) return i.followUp({ content: '⏰ 超時', flags: 64 });
+                    const m = coll.first();
+                    if (m.content.toLowerCase() === '取消') return i.followUp({ content: '❌ 已取消', flags: 64 });
+                    const input = m.content.trim();
+                    if (i.customId === 'scam_report') {
+                        const url = extractUrls(input)[0];
+                        if (!url) return i.followUp({ content: '❌ 找不到有效連結', flags: 64 });
+                        let host;
+                        try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return i.followUp({ content: '❌ 無效網址', flags: 64 }); }
+                        if (OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) return i.followUp({ content: `ℹ️ \`${host}\` 是官方網站，不會被加入`, flags: 64 });
+                        const meta = blNow.scamDomainMeta[host] = blNow.scamDomainMeta[host] || { reports: 0, hits: 0, addedBy: null, guildId: null, addedAt: Date.now(), source: '管理員回報' };
+                        meta.reports++;
+                        meta.addedBy = i.user.tag; meta.guildId = gid; meta.addedAt = Date.now(); meta.source = '管理員回報';
+                        if (!blNow.scamDomains.includes(host)) blNow.scamDomains.push(host);
+                        saveBlacklist(blNow);
+                        logAdmin(i, '回報詐騙域名', host);
+                        await i.followUp({ content: `✅ 已學習：\`${host}\`（回報 ${meta.reports} 次）`, flags: 64 });
+                    } else if (i.customId === 'scam_add') {
+                        const domain = input.toLowerCase();
+                        if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain)) return i.followUp({ content: '❌ 網域格式無效', flags: 64 });
+                        if (OFFICIAL_DOMAINS.some(o => domain === o || domain.endsWith('.' + o))) return i.followUp({ content: 'ℹ️ 官方域名不可加入', flags: 64 });
+                        if (blNow.scamDomains.includes(domain)) return i.followUp({ content: `ℹ️ \`${domain}\` 已在清單`, flags: 64 });
+                        blNow.scamDomains.push(domain);
+                        blNow.scamDomainMeta[domain] = { reports: 1, hits: 0, addedBy: i.user.tag, guildId: gid, addedAt: Date.now(), source: '管理員新增' };
+                        saveBlacklist(blNow);
+                        logAdmin(i, '新增詐騙域名', domain);
+                        await i.followUp({ content: `✅ 已新增：\`${domain}\``, flags: 64 });
+                    } else {
+                        const domain = input.toLowerCase();
+                        if (!blNow.scamDomains.includes(domain)) return i.followUp({ content: `ℹ️ \`${domain}\` 不在清單`, flags: 64 });
+                        blNow.scamDomains = blNow.scamDomains.filter(d => d !== domain);
+                        delete blNow.scamDomainMeta[domain];
+                        saveBlacklist(blNow);
+                        logAdmin(i, '刪除詐騙域名', domain);
+                        await i.followUp({ content: `✅ 已刪除：\`${domain}\``, flags: 64 });
+                    }
+                    await showScamPanel(i);
+                    } finally {
+                        releasePrompt(uid);
+                    }
+                    break;
+                }
                 // 自動回應
                 if (i.customId === 'auto_add' || i.customId === 'auto_remove') {
                     if (!isDev) return i.reply({ content: '❌ 僅開發者', flags: 64 });
@@ -1250,7 +1364,8 @@ async function showPanelFromInteraction(i) {
             .addComponents(
                 new ButtonBuilder().setCustomId('sec').setLabel('🛡️ 安全設定').setStyle(3),
                 new ButtonBuilder().setCustomId('alert').setLabel('🔔 警報設定').setStyle(2),
-                new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2)
+                new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2),
+                new ButtonBuilder().setCustomId('scam').setLabel('🌐 詐騙域名').setStyle(1)
             );
 
         const row2 = new ActionRowBuilder();
@@ -1259,7 +1374,8 @@ async function showPanelFromInteraction(i) {
                 new ButtonBuilder().setCustomId('bl').setLabel('📋 黑名單').setStyle(4),
                 new ButtonBuilder().setCustomId('wl').setLabel('👑 白名單').setStyle(3),
                 new ButtonBuilder().setCustomId('auto').setLabel('💬 自動回應').setStyle(1),
-                new ButtonBuilder().setCustomId('export').setLabel('📤 匯出').setStyle(3)
+                new ButtonBuilder().setCustomId('export').setLabel('📤 匯出').setStyle(3),
+                new ButtonBuilder().setCustomId('stop').setLabel('🛑 緊急停機').setStyle(4)
             );
         }
 
@@ -1294,7 +1410,8 @@ async function showPanelFromInteraction(i) {
                 .addComponents(
                     new ButtonBuilder().setCustomId('sec').setLabel('🛡️ 安全設定').setStyle(3),
                     new ButtonBuilder().setCustomId('alert').setLabel('🔔 警報設定').setStyle(2),
-                    new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2)
+                    new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2),
+                    new ButtonBuilder().setCustomId('scam').setLabel('🌐 詐騙域名').setStyle(1)
                 );
 
             const row2 = new ActionRowBuilder();
@@ -1303,7 +1420,8 @@ async function showPanelFromInteraction(i) {
                     new ButtonBuilder().setCustomId('bl').setLabel('📋 黑名單').setStyle(4),
                     new ButtonBuilder().setCustomId('wl').setLabel('👑 白名單').setStyle(3),
                     new ButtonBuilder().setCustomId('auto').setLabel('💬 自動回應').setStyle(1),
-                    new ButtonBuilder().setCustomId('export').setLabel('📤 匯出').setStyle(3)
+                    new ButtonBuilder().setCustomId('export').setLabel('📤 匯出').setStyle(3),
+                    new ButtonBuilder().setCustomId('stop').setLabel('🛑 緊急停機').setStyle(4)
                 );
             }
 
@@ -1482,6 +1600,21 @@ client.on(Events.MessageCreate, async (msg) => {
         const urls = extractUrls(msg.content || '');
         const hit = urls.map(u => ({ url: u, reason: getScamReason(u) })).find(x => x.reason);
         if (hit) {
+            // V0.2.7：自主學習統計——自訂域名累計命中次數；偽官方域名進學習池
+            try {
+                const hitHost = new URL(hit.url).hostname.toLowerCase();
+                const blNow = loadBlacklist();
+                if ((blNow.scamDomains || []).includes(hitHost)) {
+                    const mm = (blNow.scamDomainMeta = blNow.scamDomainMeta || {})[hitHost] = (blNow.scamDomainMeta[hitHost] || { hits: 0 });
+                    mm.hits = (mm.hits || 0) + 1;
+                    mm.lastHit = Date.now();
+                } else if (hit.reason.includes('疑似偽裝')) {
+                    const st = scamHitStats.get(hitHost) || { count: 0, firstHit: Date.now(), lastHit: Date.now() };
+                    st.count++;
+                    st.lastHit = Date.now();
+                    scamHitStats.set(hitHost, st);
+                }
+            } catch (_) {}
             console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
             try {
                 const m = await msg.guild.members.fetch(uid);
