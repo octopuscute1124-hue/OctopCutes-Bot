@@ -58,6 +58,8 @@ function loadBlacklist() {
         // V0.2.5：結構保險——即使 JSON 合法但結構不完整也不會崩潰
         if (!Array.isArray(d.bannedUsers)) d.bannedUsers = [];
         if (!d.records || typeof d.records !== 'object') d.records = {};
+        // V0.2.6：管理員自訂詐騙域名清單
+        if (!Array.isArray(d.scamDomains)) d.scamDomains = [];
         blacklistCache = d;
     }
     return blacklistCache;
@@ -100,7 +102,9 @@ function getDefaultSecurity() {
         rateLimit: true, autoDegrade: true, inviteMonitor: true,
         roleLock: true, channelSpam: true, honorGlobalBlacklist: true, logRetention: 30,
         // V0.2.5 新增：詐騙連結攔截 / 重複內容偵測 / 假冒名稱偵測
-        scamLink: true, duplicateSpam: true, impersonation: true
+        scamLink: true, duplicateSpam: true, impersonation: true,
+        // V0.2.6 新增：@everyone/@here 濫用防護
+        mentionSpam: true
     };
 }
 
@@ -223,6 +227,15 @@ function flushPendingWrites() {
         catch (e) { console.error(`寫出 ${file} 失敗:`, e.message); }
     }
     pendingWrites.clear();
+}
+
+// ============ V0.2.6 Token 遮罩 ============
+// 任何輸出/日誌中出現 DISCORD_TOKEN 時替換為遮罩，防止 crash.log 或控制台外洩 bot token
+function maskToken(text) {
+    const tok = process.env.DISCORD_TOKEN;
+    if (!tok || text == null) return text;
+    const s = String(text);
+    return s.indexOf(tok) !== -1 ? s.split(tok).join(`tk***(${tok.length}字元)`) : s;
 }
 
 function logAction(action, details) {
@@ -372,6 +385,12 @@ function cleanupTrackers() {
             }
             continue;
         }
+        // @everyone/@here 濫用（trackMention）：{times, last}，逾 60 秒無活動即刪除
+        if (key.startsWith('mention_')) {
+            data.times = (data.times || []).filter(t => now - t < 60000);
+            if (data.times.length === 0 && (data.last || 0) + 60000 < now) trackers.delete(key);
+            continue;
+        }
         // 行為追蹤（trackBehavior）：{actions, last}
         if (key.startsWith('behavior_')) {
             data.actions = (data.actions || []).filter(t => now - t < 60000);
@@ -454,6 +473,13 @@ function getScamReason(url) {
         if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return 'IP 直連連結';
         const isOfficial = OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o));
         if (isOfficial) return null;
+        // V0.2.6：管理員自訂詐騙域名（blacklist.scamDomains）；loadBlacklist 失敗時略過此檢查
+        try {
+            const customScam = (loadBlacklist().scamDomains || []);
+            for (const d of customScam) {
+                if (host === d || host.endsWith('.' + d)) return `自訂詐騙域名 (${host})`;
+            }
+        } catch (_) {}
         for (const s of SCAM_DOMAINS) {
             if (host.includes(s)) return `詐騙域名 (${host})`;
         }
@@ -493,6 +519,26 @@ function isImpersonating(user) {
     return null;
 }
 
+// ============ V0.2.6 機器人同名假冒偵測 ============
+// 發現名稱含 OctopCutes 的其他機器人時記錄警報（不自動處理，避免誤判）
+async function checkImposterBots() {
+    let found = 0;
+    for (const [, guild] of client.guilds.cache) {
+        try {
+            const members = await guild.members.fetch();
+            for (const [, m] of members) {
+                if (m.user.bot && m.user.id !== client.user.id && m.user.username.toLowerCase().includes('octopcutes')) {
+                    found++;
+                    console.warn(`🚨 疑似假冒機器人: ${m.user.tag} (ID ${m.user.id}) @ ${guild.name}`);
+                    logAction('IMPOSTER_BOT', { botId: m.user.id, botTag: m.user.tag, guildId: guild.id, guildName: guild.name });
+                }
+            }
+        } catch (_) {}
+    }
+    if (found > 0) console.warn(`🚨 共發現 ${found} 個疑似假冒機器人`);
+    return found;
+}
+
 function checkBruteForce(userId) {
     const key = `brute_${userId}`;
     const now = Date.now();
@@ -523,6 +569,18 @@ function trackBehavior(userId) {
         return true;
     }
     return false;
+}
+
+// V0.2.6：@everyone/@here 濫用追蹤——60 秒內 ≥3 次觸發
+function trackMention(userId) {
+    const key = `mention_${userId}`;
+    const now = Date.now();
+    if (!trackers.has(key)) trackers.set(key, { times: [], last: now });
+    const d = trackers.get(key);
+    d.times = d.times.filter(t => now - t < 60000);
+    d.times.push(now);
+    d.last = now;
+    return d.times.length >= 3 ? { triggered: true, count: d.times.length } : false;
 }
 
 function checkRateLimit(userId) {
@@ -603,6 +661,29 @@ client.on(Events.MessageCreate, async (msg) => {
         flushPendingWrites();
         setTimeout(() => { client.destroy(); process.exit(0); }, 500);
         return;
+    }
+    // V0.2.6：自訂詐騙域名管理（管理員）
+    const scamAdd = msg.content.trim().match(/^!章魚 加詐騙域名\s+([^\s]+)\s*$/);
+    const scamDel = msg.content.trim().match(/^!章魚 刪詐騙域名\s+([^\s]+)\s*$/);
+    if (scamAdd || scamDel) {
+        if (!msg.member?.permissions?.has(PermissionFlagsBits.Administrator)) return msg.reply('❌ 需要管理員權限！');
+        const domain = (scamAdd ? scamAdd[1] : scamDel[1]).toLowerCase();
+        if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain)) return msg.reply('❌ 網域格式無效（範例：evil-example.com）');
+        const bl = loadBlacklist();
+        bl.scamDomains = bl.scamDomains || [];
+        if (scamAdd) {
+            if (bl.scamDomains.includes(domain)) return msg.reply(`ℹ️ \`${domain}\` 已在自訂詐騙域名清單`);
+            bl.scamDomains.push(domain);
+            saveBlacklist(bl);
+            logAction('SCAM_DOMAIN_ADD', { adminId: msg.author.id, adminTag: msg.author.tag, guildId: msg.guildId, domain });
+            return msg.reply(`✅ 已加入自訂詐騙域名：\`${domain}\``);
+        } else {
+            if (!bl.scamDomains.includes(domain)) return msg.reply(`ℹ️ \`${domain}\` 不在自訂詐騙域名清單`);
+            bl.scamDomains = bl.scamDomains.filter(d => d !== domain);
+            saveBlacklist(bl);
+            logAction('SCAM_DOMAIN_REMOVE', { adminId: msg.author.id, adminTag: msg.author.tag, guildId: msg.guildId, domain });
+            return msg.reply(`✅ 已移除自訂詐騙域名：\`${domain}\``);
+        }
     }
     if (msg.content.trim() !== '!章魚') return;
     if (!msg.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
@@ -692,7 +773,9 @@ const SECURITY_FEATURES = [
     ['bruteForce', '面板冷卻'], ['rateLimit', 'RateLimit'], ['autoDegrade', '降級'],
     ['inviteMonitor', '邀請'], ['roleLock', '角色鎖定'], ['channelSpam', '頻道監控'],
     // V0.2.5 新增
-    ['scamLink', '詐騙連結'], ['duplicateSpam', '重複內容'], ['impersonation', '假冒名稱']
+    ['scamLink', '詐騙連結'], ['duplicateSpam', '重複內容'], ['impersonation', '假冒名稱'],
+    // V0.2.6 新增
+    ['mentionSpam', '@everyone']
 ];
 const SEC_PAGE_SIZE = 10;
 
@@ -1435,6 +1518,21 @@ client.on(Events.MessageCreate, async (msg) => {
         }
     }
 
+    // @everyone/@here 濫用（V0.2.6）：60 秒內 ≥3 次觸發，刪訊息＋警告（管理員/白名單豁免）
+    if (sec.mentionSpam !== false && /@everyone|@here/.test(msg.content || '')) {
+        const mnt = trackMention(uid);
+        if (mnt) {
+            console.log(`⚠️ @everyone 濫用: ${msg.author.tag} (${mnt.count}次/60秒)`);
+            try {
+                const m = await msg.guild.members.fetch(uid);
+                if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
+                    await msg.delete().catch(() => {});
+                    await warnUser(m, msg.channel, `短時間內多次 @everyone/@here（${mnt.count} 次）`, '@everyone 濫用');
+                }
+            } catch (_) {}
+        }
+    }
+
     // 爬蟲
     if (sec.crawlerDetection !== false) {
         const r = DETECT.crawler(uid, gid);
@@ -1589,6 +1687,7 @@ client.on(Events.GuildCreate, async (guild) => {
     getSecurity(guild.id); // 建立預設安全設定
     saveConfig();
     await scanAll(); // 立即套用全域黑名單
+    checkImposterBots().catch(() => {}); // V0.2.6：掃描是否有假冒本機器人的其他機器人
 });
 
 client.on(Events.GuildDelete, (guild) => {
@@ -1600,6 +1699,16 @@ client.on(Events.GuildDelete, (guild) => {
 client.on(Events.GuildMemberAdd, async (m) => {
     const gid = m.guild.id;
     const sec = getSecurity(gid);
+
+    // V0.2.6：加入即查全域黑名單（不必等 scanAll 定時掃描）
+    if (sec.honorGlobalBlacklist !== false) {
+        const bl = loadBlacklist();
+        if (bl.bannedUsers.includes(m.id)) {
+            console.log(`🔨 即時黑名單: ${m.user.tag} 加入 ${m.guild.name}，立即封鎖`);
+            try { await banUser(m, '🐙 全域黑名單', '加入即封鎖'); } catch (_) {}
+            return;
+        }
+    }
 
     if (sec.suspiciousAccount !== false) {
         const r = isSuspicious(m.user);
@@ -1745,18 +1854,45 @@ client.on(Events.ChannelDelete, async (ch) => {
 // ============ 清理 ============
 setInterval(cleanupTrackers, 60000);
 
+// V0.2.6：記憶體感知——RSS 高水位時自動縮短掃描間隔並加強清理，低於警戒後回復
+let scanIntervalMs = 30 * 60 * 1000;
+let lastScanTs = 0;
+function memoryCheck() {
+    const rss = process.memoryUsage().rss / 1048576;
+    const mb = () => Math.round(rss);
+    if (rss > 260) {
+        if (scanIntervalMs !== 6 * 60 * 1000) {
+            scanIntervalMs = 6 * 60 * 1000;
+            console.warn(`⚠️ 記憶體高水位 (${mb()}MB)，掃描間隔縮短至 6 分鐘`);
+        }
+        cleanupTrackers();
+    } else if (rss > 180) {
+        if (scanIntervalMs !== 10 * 60 * 1000) {
+            scanIntervalMs = 10 * 60 * 1000;
+            console.warn(`⚠️ 記憶體偏高 (${mb()}MB)，掃描間隔縮短至 10 分鐘`);
+        }
+    } else if (scanIntervalMs !== 30 * 60 * 1000) {
+        scanIntervalMs = 30 * 60 * 1000;
+        console.log(`✅ 記憶體恢復正常 (${mb()}MB)，掃描間隔回復 30 分鐘`);
+    }
+    return rss;
+}
+setInterval(memoryCheck, 60000);
 setInterval(async () => {
-    console.log('🔄 定期掃描...');
-    await scanAll();
-}, 30 * 60 * 1000);
+    if (Date.now() - lastScanTs >= scanIntervalMs) {
+        lastScanTs = Date.now();
+        console.log('🔄 定期掃描...');
+        await scanAll();
+    }
+}, 60000);
 
 // ============ 全域錯誤處理 ============
 // 防止任何單一 Promise 拒絕或未捕捉例外導致整個機器人靜默退出，
 // 並將錯誤寫入 crash.log 以便追查根因。
 function writeCrash(type, err) {
     const line = `[${new Date().toISOString()}] ${type}: ${err && err.stack ? err.stack : String(err)}\n`;
-    console.error(type === 'uncaughtException' ? '💥' : '🚨', err && err.message ? err.message : err);
-    try { fs.appendFileSync('./crash.log', line); } catch (_) {}
+    console.error(type === 'uncaughtException' ? '💥' : '🚨', maskToken(err && err.message ? err.message : err));
+    try { fs.appendFileSync('./crash.log', maskToken(line)); } catch (_) {}
 }
 process.on('unhandledRejection', (reason) => { writeCrash('unhandledRejection', reason); });
 process.on('uncaughtException', (err) => {
@@ -1766,10 +1902,10 @@ process.on('uncaughtException', (err) => {
 });
 // V0.2.4：監聽 discord.js 的 error/warn 事件（未監聽的 error 事件會直接讓 Node 崩潰）
 client.on('error', (e) => writeCrash('clientError', e));
-client.on('warn', (w) => console.warn('⚠️', w && w.message ? w.message : w));
+client.on('warn', (w) => console.warn('⚠️', maskToken(w && w.message ? w.message : w)));
 // V0.2.4：停止前強制寫出未落盤的日誌緩衝，避免資料遺失
-process.on('SIGTERM', () => { flushPendingWrites(); process.exit(0); });
-process.on('SIGINT', () => { flushPendingWrites(); process.exit(0); });
+process.on('SIGTERM', () => { flushPendingWrites(); releaseInstanceLock(); process.exit(0); });
+process.on('SIGINT', () => { flushPendingWrites(); releaseInstanceLock(); process.exit(0); });
 
 // ============ 啟動（含登入失敗重試） ============
 // V0.2.5：啟動前驗證環境設定，避免缺少 token 時無限重試循環
@@ -1795,4 +1931,40 @@ async function startBot() {
     }
 }
 if (!validateEnv()) process.exit(1);
+
+// ============ V0.2.6 啟動防護 ============
+// 單實例鎖：防止重複啟動雙實例同時操作設定檔/黑名單造成衝突
+const LOCK_FILE = require('path').join(require('os').tmpdir(), 'octopus-bot.lock');
+function acquireInstanceLock() {
+    try {
+        if (fs.existsSync(LOCK_FILE)) {
+            const oldPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10);
+            if (oldPid && Number.isInteger(oldPid) && oldPid > 0) {
+                try { process.kill(oldPid, 0); console.error(`❌ 另一個實例正在運行 (PID ${oldPid})，拒絕啟動`); process.exit(1); }
+                catch (e) { /* PID 已不存在，可覆寫 */ }
+            }
+        }
+        fs.writeFileSync(LOCK_FILE, String(process.pid));
+        console.log(`🔒 單實例鎖已取得 (PID ${process.pid})`);
+    } catch (e) { console.warn(`⚠️ 無法建立實例鎖: ${e.message}`); }
+}
+function releaseInstanceLock() {
+    try {
+        if (fs.existsSync(LOCK_FILE) && fs.readFileSync(LOCK_FILE, 'utf8') === String(process.pid)) fs.unlinkSync(LOCK_FILE);
+    } catch (_) {}
+}
+// .env 權限檢查（僅 Unix）：group/other 可讀時警告，防止 token 被其他使用者竊取
+function checkEnvFilePerm() {
+    if (process.platform === 'win32') return;
+    try {
+        const st = fs.statSync('.env');
+        if (st.mode & 0o077) console.warn(`⚠️ .env 權限過寬 (${(st.mode & 0o777).toString(8)})，建議 chmod 600 .env`);
+    } catch (_) {}
+}
+
+acquireInstanceLock();
+checkEnvFilePerm();
 startBot();
+// V0.2.6：啟動後 60 秒與每 6 小時掃描機器人同名假冒
+setTimeout(() => checkImposterBots().catch(() => {}), 60000);
+setInterval(() => checkImposterBots().catch(() => {}), 6 * 60 * 60 * 1000);
