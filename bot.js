@@ -1082,8 +1082,48 @@ function learnScamDomains() {
     console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}、老化清除 ${forgotten}、降級 ${unconfirmed}`);
     return { learned, removed, forgotten, unconfirmed };
 }
+// V0.4.0：每日學習彙報——學習回合後向各伺服器警報頻道推送摘要，管理員看得到機器人在學什麼
+// 內容：本次回合新增/移除/老化/降級 ＋ 近 24 小時爆發式即時提升清單（即時封鎖的透明度）
+async function reportLearning(summary = {}) {
+    try {
+        const now = Date.now();
+        const immediate = [];
+        const bl = loadBlacklist();
+        for (const [host, meta] of Object.entries(bl.scamDomainMeta || {})) {
+            if (meta.learnedAt && now - meta.learnedAt < 86400000 && meta.source === '自主學習') {
+                immediate.push({ host, reports: meta.reports || 0, confirmed: !!meta.confirmed });
+            }
+        }
+        const total = (summary.learned || 0) + (summary.removed || 0) + (summary.forgotten || 0) + (summary.unconfirmed || 0);
+        if (total === 0 && immediate.length === 0) return; // 無變動不推送，避免打擾
+        const embed = new EmbedBuilder()
+            .setColor(0x00aaff)
+            .setTitle('🧠 學習彙報（24h）')
+            .setDescription('機器人自主學習的詐騙域名變動摘要')
+            .addFields(
+                { name: '新增（多來源確認）', value: `${summary.learned || 0} 個`, inline: true },
+                { name: '移除', value: `${summary.removed || 0} 個`, inline: true },
+                { name: '老化清除', value: `${summary.forgotten || 0} 個`, inline: true },
+                { name: '降級回候選', value: `${summary.unconfirmed || 0} 個`, inline: true }
+            );
+        if (immediate.length) {
+            embed.addFields({ name: '⚡ 近 24h 即時封鎖（爆發）', value: immediate.map(x => `${x.host}（${x.reports} 命中${x.confirmed ? '・多來源' : ''}）`).join('\n').slice(0, 900) || '無' });
+        }
+        for (const guild of client.guilds.cache.values()) {
+            await sendAlert(guild.id, embed);
+        }
+    } catch (e) {
+        console.error('學習彙報失敗:', e.message);
+    }
+}
+
 // 每 24 小時執行一次學習回合
-setInterval(() => { try { learnScamDomains(); } catch (e) { console.error('學習失敗:', e.message); } }, 24 * 60 * 60 * 1000);
+setInterval(() => {
+    try {
+        const r = learnScamDomains();
+        reportLearning(r); // V0.4.0：學習彙報推送
+    } catch (e) { console.error('學習失敗:', e.message); }
+}, 24 * 60 * 60 * 1000);
 
 function checkBruteForce(userId) {
     const key = `brute_${userId}`;
