@@ -7,4 +7,5 @@ nohup.out
 config.json
 blacklist.json
 logs.json
+backups/
 .DS_Store
