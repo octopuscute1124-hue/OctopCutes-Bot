@@ -25,7 +25,7 @@ check('長度差', levenshtein('abc', 'abcdef'), 3);
 check('完全不同', levenshtein('abc', 'xyz'), 3);
 
 // ===== isTyposquatOf（含 levenshtein 定義）=====
-const tsStart = src.indexOf('function levenshtein');
+const tsStart = src.indexOf('function deobfuscate');
 const tsEnd = src.indexOf('// 清除超過 72 小時未命中的過期候選');
 if (tsStart === -1 || tsEnd === -1) { console.error('❌ 找不到 isTyposquatOf'); process.exit(1); }
 const OFFLINE = ['discord.com', 'discord.gg', 'github.com', 'steampowered.com', 'google.com'];

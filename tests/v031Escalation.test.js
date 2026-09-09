@@ -44,7 +44,7 @@ const calls = { ban: 0, warn: 0, timeout: 0, logs: [] };
 const member = {
     id: 'u1',
     guild: { id: 'g1', name: '測試伺服器' },
-    user: { tag: '測試者#0001' },
+    user: { tag: '測試者#0001', createdTimestamp: Date.now() - 30 * 86400000 },
     timeout: async (ms, reason) => { calls.timeout++; calls.timeoutMs = ms; calls.timeoutReason = reason; }
 };
 const esc = new Function(

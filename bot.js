@@ -372,6 +372,22 @@ function isKnownOffender(userId) {
     return logsBuffer.some(l => l.action === 'BAN' && l.details && l.details.userId === userId);
 }
 
+// V0.3.6：信任分層——同一行為依信任度加權，避免誤傷資深成員（0.6/1.0/1.3）
+function getTrustTier(member) {
+    try {
+        const user = member.user || {};
+        const ageDays = (Date.now() - (user.createdTimestamp || Date.now())) / 86400000;
+        // 管理員與白名單：高信任，風險權重降 40%
+        if ((member.permissions && member.permissions.has && member.permissions.has(PermissionFlagsBits.Administrator))
+            || isWhitelisted(member)) {
+            return { tier: 'high', multiplier: 0.6 };
+        }
+        // 低齡帳號（<7 天）：低信任，風險權重升 30%——釣魚/撞庫常用新號
+        if (ageDays < 7) return { tier: 'low', multiplier: 1.3 };
+    } catch (_) {}
+    return { tier: 'normal', multiplier: 1.0 };
+}
+
 // 半衰期 10 分鐘：異常發生後影響力每 10 分鐘減半
 const RISK_HALF_LIFE = 10 * 60 * 1000;
 // 訊號權重：強訊號（明確惡意）權重高；輕訊號（易誤判，如 @mention/重複）權重低
@@ -391,11 +407,13 @@ function getRiskScore(userId, guildId) {
     return d.score * Math.pow(0.5, elapsed / RISK_HALF_LIFE);
 }
 
-// 累加風險：分數 = 衰減後殘留分數 + 本次訊號權重 + 累犯加成（V0.3.5：有 BAN 紀錄者再犯門檻更低）
-function addRisk(userId, guildId, kind) {
+// 累加風險：分數 = 衰減後殘留分數 + (本次訊號權重 + 累犯加成) × 信任係數
+// V0.3.6：meta.trustMultiplier——高信任 0.6（管理員/白名單）、低信任 1.3（<7 天新帳號）
+function addRisk(userId, guildId, kind, meta = {}) {
     const w = SIGNAL_WEIGHTS[kind] || 1;
     const offenderBonus = isKnownOffender(userId) ? 1 : 0;
-    const score = getRiskScore(userId, guildId) + w + offenderBonus;
+    const mult = typeof meta.trustMultiplier === 'number' ? meta.trustMultiplier : 1;
+    const score = getRiskScore(userId, guildId) + (w + offenderBonus) * mult;
     trackers.set(`risk_${userId}_${guildId}`, { score, last: Date.now() });
     return score;
 }
@@ -411,7 +429,10 @@ async function escalatePunishment(member, channel, kind, reason, opts = {}) {
         if (strikes >= 2) return await banUser(member, `🐙 ${reason}（累犯 ${strikes} 次）`, kind, channel);
         return await warnUser(member, channel, reason, kind);
     }
-    const score = addRisk(uid, gid, kind);
+    const trustMultiplier = (opts.meta && typeof opts.meta.trustMultiplier === 'number')
+        ? opts.meta.trustMultiplier
+        : getTrustTier(member).multiplier; // V0.3.6：信任分層
+    const score = addRisk(uid, gid, kind, { trustMultiplier });
     if (score >= 10) {
         return await banUser(member, `🐙 ${reason}（風險 ${score.toFixed(1)} 分）`, kind, channel);
     }
@@ -694,6 +715,16 @@ function isShortener(host) {
     return SHORTENER_DOMAINS.includes(host);
 }
 
+// V0.3.6：Raid 精準偵測——只統計低齡帳號（<7 天）湧入；正常成員移入不算，避免誤報
+const raidJoins = new Map(); // gid -> [{ ts, lowAge }]
+function trackRaidJoin(gid, accountAgeDays) {
+    const now = Date.now();
+    const arr = (raidJoins.get(gid) || []).filter(e => now - e.ts < 60000);
+    arr.push({ ts: now, lowAge: typeof accountAgeDays === 'number' && accountAgeDays < 7 });
+    raidJoins.set(gid, arr);
+    return arr.filter(e => e.lowAge).length;
+}
+
 // V0.3.0：大量加入防護——60 秒內 ≥5 個新成員加入即回傳數量（防 raid 警示）
 function trackJoin(gid) {
     const now = Date.now();
@@ -869,10 +900,23 @@ function recordScamCandidate(host, meta = {}) {
     if (typeof meta.accountAgeDays === 'number' && meta.accountAgeDays < 7) gain++;
     // 仿冒官方：與官方域名相似的 typosquat → 加權（模仿官方拼寫是明確仿冒意圖）
     if (isTyposquatOf(host)) gain++;
+    // V0.3.6：跨使用者共識——同一域名被 ≥2 個不同使用者發送 → 加權（多人中招更可信）
+    if (typeof meta.senderCount === 'number' && meta.senderCount >= 2) gain++;
     st.count += gain;
     st.lastHit = Date.now();
     saveBlacklist(loadBlacklist());
 }
+// V0.3.6：連結觀察池——同一可疑連結被 ≥2 個「不同使用者」發送才算多人共識（記憶體，輕量）
+const linkWatch = new Map(); // host -> { users: Set, count, firstSeen }
+function watchLink(host, userId) {
+    const now = Date.now();
+    if (!linkWatch.has(host)) linkWatch.set(host, { users: new Set(), count: 0, firstSeen: now });
+    const w = linkWatch.get(host);
+    w.users.add(userId);
+    w.count++;
+    return { hits: w.count, distinctUsers: w.users.size, consensus: w.count >= 2 && w.users.size >= 2 };
+}
+
 // 域名格式驗證（防駭）：避免學習/新增注入怪異字串污染清單
 function isValidDomain(host) {
     if (typeof host !== 'string') return false;
@@ -882,6 +926,12 @@ function isValidDomain(host) {
     if (h.includes('..')) return false;
     return true;
 }
+// V0.3.6：同形字還原——把 leet/混淆字元換回正常字母（d1sc0rd.com → discord.com）
+function deobfuscate(str) {
+    const map = { '0': 'o', '1': 'l', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's', '!': 'i' };
+    return String(str || '').toLowerCase().replace(/[013457@$!]/g, c => map[c]);
+}
+
 // V0.3.5：編輯距離——輕量 Levenshtein 實作（僅在詐騙命中/候選評估時呼叫，頻率低）
 function levenshtein(a, b) {
     const m = a.length, n = b.length;
@@ -907,9 +957,12 @@ const OFFICIAL_BRANDS = ['discord', 'steam', 'github', 'gitlab', 'youtube', 'twi
 
 // V0.3.5：仿冒官方域名偵測——編輯距離 ≤2，或含官方品牌名＋額外字元（disc0rd.com、discord-verify.com、steamgift.net）
 function isTyposquatOf(host) {
-    const h = String(host || '').trim().toLowerCase();
+    const raw = String(host || '').trim().toLowerCase();
+    const h = deobfuscate(raw);
+    const obfuscated = h !== raw; // 原字串含混淆字元（d1sc0rd.com）
     if (!isValidDomain(h)) return false;
-    if (OFFICIAL_DOMAINS.some(o => h === o || h.endsWith('.' + o))) return false;
+    // 官方域名本身不算仿冒——但若原字串是混淆過的官方域名（obfuscated）仍視為仿冒
+    if (!obfuscated && OFFICIAL_DOMAINS.some(o => h === o || h.endsWith('.' + o))) return false;
     for (const o of OFFICIAL_DOMAINS) {
         if (levenshtein(h, o) <= 2) return true;
     }
@@ -2017,9 +2070,11 @@ client.on(Events.MessageCreate, async (msg) => {
                         mm.hits = (mm.hits || 0) + 1;
                         mm.lastHit = Date.now();
                     } else if (hit.reason.includes('疑似偽裝') && isValidDomain(hitHost)) {
+                        const w = watchLink(hitHost, uid);
                         recordScamCandidate(hitHost, {
                             guildId: gid,
-                            accountAgeDays: (Date.now() - (msg.author.createdTimestamp || Date.now())) / 86400000
+                            accountAgeDays: (Date.now() - (msg.author.createdTimestamp || Date.now())) / 86400000,
+                            senderCount: w.distinctUsers
                         });
                     }
                 } catch (_) {}
@@ -2313,14 +2368,14 @@ client.on(Events.GuildMemberAdd, async (m) => {
         }
     }
 
-    // V0.3.0：大量加入防護（raid 偵測）——僅警示，不自動處理，避免誤傷正常加入
-    const joinCount = trackJoin(gid);
+    // V0.3.6：Raid 精準偵測——只統計低齡帳號（<7 天）湧入，正常移入不誤報；僅警示不自動處理
+    const joinCount = trackRaidJoin(gid, (Date.now() - (m.user.createdTimestamp || Date.now())) / 86400000);
     if (joinCount >= 5 && isAlertEnabled(gid, 'suspiciousAccount')) {
         try {
             const embed = new EmbedBuilder()
                 .setColor(0xff0000)
-                .setTitle('🚨 大量成員加入')
-                .setDescription(`**${m.guild.name}** 在 60 秒內有 ${joinCount} 個新成員加入`)
+                .setTitle('🚨 大量低齡帳號湧入')
+                .setDescription(`**${m.guild.name}** 在 60 秒內有 ${joinCount} 個新帳號（<7 天）加入`)
                 .addFields({ name: 'ID', value: m.user.id, inline: true })
                 .setTimestamp();
             await sendAlert(gid, embed);
