@@ -62,6 +62,8 @@ function loadBlacklist() {
         if (!Array.isArray(d.scamDomains)) d.scamDomains = [];
         // V0.2.7：詐騙域名學習紀錄（回報次數/命中次數/來源）
         if (!d.scamDomainMeta || typeof d.scamDomainMeta !== 'object') d.scamDomainMeta = {};
+        // V0.2.8：詐騙學習候選池（持久化，重啟不丟學習進度）
+        if (!d.scamCandidateStats || typeof d.scamCandidateStats !== 'object') d.scamCandidateStats = {};
         blacklistCache = d;
     }
     return blacklistCache;
@@ -544,21 +546,63 @@ async function checkImposterBots() {
 // ============ V0.2.7 詐騙域名自主學習（輕量規則式，無需 ML） ============
 // 1) 偽官方域名（discord/steam/nitro 但非官方）被不同訊息命中 ≥3 次 → 自動提升為明確詐騙域名
 // 2) 自訂域名加入超過 14 天仍零命中 → 低置信，自動移除
-const scamHitStats = new Map();
+// V0.2.8：詐騙學習候選池——持久化至 blacklist.json，每日隨機重啟不再遺失學習進度
+// 結構：{ host: { count, firstHit, lastHit } }；count ≥3 且非官方 → 提升為明確詐騙域名
+function getScamCandidates() {
+    const bl = loadBlacklist();
+    if (!bl.scamCandidateStats || typeof bl.scamCandidateStats !== 'object') bl.scamCandidateStats = {};
+    return bl.scamCandidateStats;
+}
+// 命中「疑似偽裝官方」時累計候選計數並立即寫入黑名單檔（輕量持久化）
+function recordScamCandidate(host) {
+    const cand = getScamCandidates();
+    const st = cand[host] = cand[host] || { count: 0, firstHit: Date.now(), lastHit: Date.now() };
+    st.count++;
+    st.lastHit = Date.now();
+    saveBlacklist(loadBlacklist());
+}
+// 域名格式驗證（防駭）：避免學習/新增注入怪異字串污染清單
+function isValidDomain(host) {
+    if (typeof host !== 'string') return false;
+    const h = host.trim().toLowerCase();
+    if (!h || h.length > 253) return false;
+    if (!/^(?=.*\.)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(h)) return false;
+    if (h.includes('..')) return false;
+    return true;
+}
+// 清除超過 72 小時未命中的過期候選（記憶體高水位時呼叫）
+function pruneScamCandidates() {
+    const cand = getScamCandidates();
+    const now = Date.now();
+    let n = 0;
+    for (const [h, st] of Object.entries(cand)) {
+        if (now - (st.lastHit || st.firstHit || 0) > 72 * 60 * 60 * 1000) { delete cand[h]; n++; }
+    }
+    if (n > 0) saveBlacklist(loadBlacklist());
+    return n;
+}
 function learnScamDomains() {
     const bl = loadBlacklist();
     bl.scamDomains = bl.scamDomains || [];
     bl.scamDomainMeta = bl.scamDomainMeta || {};
+    const candidates = getScamCandidates();
     const now = Date.now();
-    let learned = 0, removed = 0;
-    // 1) 自動提升
-    for (const [host, st] of scamHitStats) {
+    let learned = 0, removed = 0, forgotten = 0;
+    // 1) 自動提升：候選命中 ≥3 次且非官方 → 提升為明確詐騙域名（學習後移除候選）
+    for (const [host, st] of Object.entries(candidates)) {
         if (st.count >= 3 && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
             bl.scamDomains.push(host);
             bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now };
             logAction('SCAM_LEARN', { domain: host, reports: st.count });
             console.log(`🧠 自主學習: ${host} 被命中 ${st.count} 次，已加入詐騙域名`);
             learned++;
+            delete candidates[host];
+            continue;
+        }
+        // V0.2.8：候選老化——超過 72 小時未再命中即清除（防誤判與無界累積）
+        if (now - (st.lastHit || st.firstHit || 0) > 72 * 60 * 60 * 1000) {
+            delete candidates[host];
+            forgotten++;
         }
     }
     // 2) 低置信移除
@@ -572,10 +616,9 @@ function learnScamDomains() {
             removed++;
         }
     }
-    scamHitStats.clear();
-    if (learned || removed) saveBlacklist(bl);
-    console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}`);
-    return { learned, removed };
+    if (learned || removed || forgotten) saveBlacklist(bl);
+    console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}、老化清除 ${forgotten}`);
+    return { learned, removed, forgotten };
 }
 // 每 24 小時執行一次學習回合
 setInterval(() => { try { learnScamDomains(); } catch (e) { console.error('學習失敗:', e.message); } }, 24 * 60 * 60 * 1000);
@@ -1225,6 +1268,7 @@ client.on(Events.InteractionCreate, async (i) => {
                         if (!url) return i.followUp({ content: '❌ 找不到有效連結', flags: 64 });
                         let host;
                         try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return i.followUp({ content: '❌ 無效網址', flags: 64 }); }
+                        if (!isValidDomain(host)) return i.followUp({ content: '⚠️ 網址格式無效，請提供合法網域', flags: 64 });
                         if (OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) return i.followUp({ content: `ℹ️ \`${host}\` 是官方網站，不會被加入`, flags: 64 });
                         const meta = blNow.scamDomainMeta[host] = blNow.scamDomainMeta[host] || { reports: 0, hits: 0, addedBy: null, guildId: null, addedAt: Date.now(), source: '管理員回報' };
                         meta.reports++;
@@ -1235,7 +1279,7 @@ client.on(Events.InteractionCreate, async (i) => {
                         await i.followUp({ content: `✅ 已學習：\`${host}\`（回報 ${meta.reports} 次）`, flags: 64 });
                     } else if (i.customId === 'scam_add') {
                         const domain = input.toLowerCase();
-                        if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain)) return i.followUp({ content: '❌ 網域格式無效', flags: 64 });
+                        if (!isValidDomain(domain)) return i.followUp({ content: '⚠️ 域名格式無效（僅允許 a-z/0-9/./-，最長 253 字元）', flags: 64 });
                         if (OFFICIAL_DOMAINS.some(o => domain === o || domain.endsWith('.' + o))) return i.followUp({ content: 'ℹ️ 官方域名不可加入', flags: 64 });
                         if (blNow.scamDomains.includes(domain)) return i.followUp({ content: `ℹ️ \`${domain}\` 已在清單`, flags: 64 });
                         blNow.scamDomains.push(domain);
@@ -1608,11 +1652,8 @@ client.on(Events.MessageCreate, async (msg) => {
                     const mm = (blNow.scamDomainMeta = blNow.scamDomainMeta || {})[hitHost] = (blNow.scamDomainMeta[hitHost] || { hits: 0 });
                     mm.hits = (mm.hits || 0) + 1;
                     mm.lastHit = Date.now();
-                } else if (hit.reason.includes('疑似偽裝')) {
-                    const st = scamHitStats.get(hitHost) || { count: 0, firstHit: Date.now(), lastHit: Date.now() };
-                    st.count++;
-                    st.lastHit = Date.now();
-                    scamHitStats.set(hitHost, st);
+                } else if (hit.reason.includes('疑似偽裝') && isValidDomain(hitHost)) {
+                    recordScamCandidate(hitHost);
                 }
             } catch (_) {}
             console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
@@ -1999,6 +2040,7 @@ function memoryCheck() {
             console.warn(`⚠️ 記憶體高水位 (${mb()}MB)，掃描間隔縮短至 6 分鐘`);
         }
         cleanupTrackers();
+        pruneScamCandidates();
     } else if (rss > 180) {
         if (scanIntervalMs !== 10 * 60 * 1000) {
             scanIntervalMs = 10 * 60 * 1000;
