@@ -29,13 +29,32 @@ const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const LOG_FILE = path.join(DATA_DIR, 'logs.json');
 
 // ============ 工具函數 ============
+// V0.3.3：原型污染消毒——JSON 載入時剝離 __proto__/constructor/prototype 鍵
+// 攻擊者若竄改資料檔寫入 __proto__ 鍵，JSON.parse 後可能污染物件原型造成注入
+function sanitizeJSON(obj, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 20) return obj;
+    if (Array.isArray(obj)) {
+        for (let i = 0; i < obj.length; i++) obj[i] = sanitizeJSON(obj[i], depth + 1);
+        return obj;
+    }
+    for (const k of Object.keys(obj)) {
+        if (k === '__proto__' || k === 'constructor' || k === 'prototype') {
+            delete obj[k];
+            continue;
+        }
+        obj[k] = sanitizeJSON(obj[k], depth + 1);
+    }
+    return obj;
+}
+
 function loadJSON(file, fallback) {
     try {
         if (fs.existsSync(file)) {
             const raw = fs.readFileSync(file, 'utf8');
             const data = JSON.parse(raw);
             if (typeof data !== 'object' || data === null) throw new Error('JSON 根節點非物件');
-            return data;
+            // V0.3.3：原型污染消毒
+            return sanitizeJSON(data);
         }
     } catch (e) {
         console.error(`讀取 ${file} 失敗:`, e.message);
@@ -116,14 +135,17 @@ function getDefaultSecurity() {
         // V0.2.5 新增：詐騙連結攔截 / 重複內容偵測 / 假冒名稱偵測
         scamLink: true, duplicateSpam: true, impersonation: true,
         // V0.2.6 新增：@everyone/@here 濫用防護
-        mentionSpam: true
+        mentionSpam: true,
+        // V0.3.3 新增：進階注入偵測（SQL/命令/模板）
+        injectionDetection: true
     };
 }
 
 function getDefaultAlert() {
     return {
         suspiciousAccount: true, floodJoin: true, webhookAbuse: true, permissionAbuse: true,
-        botBanned: true, channelSpam: true, roleAbuse: true, inviteAbuse: true, richPresence: true
+        botBanned: true, channelSpam: true, roleAbuse: true, inviteAbuse: true, richPresence: true,
+        contentAbuse: true
     };
 }
 
@@ -674,6 +696,29 @@ function detectTextScam(content) {
         [/(?:steam|discord)[\s-]+gift[\s-]+(?:code|card)/i, '贈禮碼話術'],
         [/verify[\s-]+(?:your|the)[\s-]+(?:account|server|discord)/i, '驗證帳號釣魚話術'],
         [/\b(?:discordnitro|nitro\s+gift|free\s+nitro)\b/i, 'Nitro 關鍵字話術']
+    ];
+    for (const [p, reason] of patterns) {
+        if (p.test(c)) return reason;
+    }
+    return null;
+}
+
+// V0.3.3：進階注入偵測——SQL 注入/命令注入/惡意模板（僅警示，不刪除不處罰）
+// 只命中「明確惡意組合」，一般教學內容（SELECT * FROM users、${name} 模板字串）不會誤判
+function detectInjection(content) {
+    const c = String(content || '');
+    if (c.length > 4000) return null; // 超長訊息交給資源耗盡防禦處理
+    const patterns = [
+        [/(?:'|")\s*(?:or|and)\s+(?:'|")?\d+(?:'|")?\s*=\s*(?:'|")?\d+/i, 'SQL 注入（恆真條件）'],
+        [/\bunion\s+select\s+(?:null|\d+|\w+)(?:\s*,\s*(?:null|\d+|\w+)){0,9}/i, 'SQL 注入（UNION SELECT）'],
+        [/;\s*(?:drop|delete|truncate|update|insert)\s+(?:table|from|into)/i, 'SQL 注入（破壞性語句）'],
+        [/\b(?:or|and)\b[^;\n]{0,40}=[^;\n]{0,40}--/i, 'SQL 注入（注釋繞過）'],
+        [/;\s*(?:rm|sh|bash|wget|curl|nc|ncat|python3?|powershell|cmd|perl)\s/i, '命令注入（分號鏈接）'],
+        [/\|\s*(?:sh|bash|nc|ncat|python3?)\s/i, '命令注入（管道執行）'],
+        [/\$\s*\(\s*[a-z_][a-z0-9_]*\s/i, '命令注入（$() 執行）'],
+        [/\x60[^\x60\n]{2,}\x60/, '命令注入（反引號執行）'],
+        [/\$\{\s*(?:require|process|global|eval|Function|child_process|exec)\b/i, 'JS 注入（惡意模板）'],
+        [/\{\{\s*(?:config|settings|env|this\.|process)\b/i, '模板注入']
     ];
     for (const [p, reason] of patterns) {
         if (p.test(c)) return reason;
@@ -1936,6 +1981,50 @@ client.on(Events.MessageCreate, async (msg) => {
                     await sendAlert(gid, embed);
                 } catch (_) {}
             }
+        }
+    }
+
+    // V0.3.3：進階注入偵測——SQL/命令/模板注入樣式（僅警示，不刪除不處罰）
+    if (sec.injectionDetection !== false) {
+        const inj = detectInjection(msg.content);
+        if (inj && isAlertEnabled(gid, 'contentAbuse')) {
+            console.log(`⚠️ 注入樣式: ${msg.author.tag} -> ${inj}`);
+            try {
+                const embed = new EmbedBuilder()
+                    .setColor(0xff6600)
+                    .setTitle('⚠️ 注入攻擊樣式')
+                    .setDescription(`**${msg.author.tag}** 發送疑似注入內容`)
+                    .addFields({ name: '原因', value: inj, inline: false })
+                    .setTimestamp();
+                await sendAlert(gid, embed);
+            } catch (_) {}
+        }
+    }
+
+    // V0.3.3：資源耗盡防禦——超長訊息/超多附件只警示，跳過重量級偵測避免 DoS
+    if (msg.content.length > 4000) {
+        if (isAlertEnabled(gid, 'contentAbuse')) {
+            try {
+                const embed = new EmbedBuilder()
+                    .setColor(0xff6600)
+                    .setTitle('⚠️ 超長訊息')
+                    .setDescription(`**${msg.author.tag}** 發送 ${msg.content.length} 字元訊息（上限 4000）`)
+                    .setTimestamp();
+                await sendAlert(gid, embed);
+            } catch (_) {}
+        }
+        return;
+    }
+    if (msg.attachments.size > 5) {
+        if (isAlertEnabled(gid, 'contentAbuse')) {
+            try {
+                const embed = new EmbedBuilder()
+                    .setColor(0xff6600)
+                    .setTitle('⚠️ 附件炸彈')
+                    .setDescription(`**${msg.author.tag}** 單則訊息附帶 ${msg.attachments.size} 個附件`)
+                    .setTimestamp();
+                await sendAlert(gid, embed);
+            } catch (_) {}
         }
     }
 
