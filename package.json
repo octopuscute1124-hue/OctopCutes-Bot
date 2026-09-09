@@ -1,11 +1,11 @@
 {
   "name": "octopcutes-bot",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "OctopCutes Discord 防護機器人（自動安全防護、全域黑名單、控制面板）",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "test": "node tests/cleanupTrackers.test.js && node tests/scheduleSave.test.js && node tests/scamLink.test.js && node tests/duplicateSpam.test.js && node tests/v026Security.test.js && node tests/v027Learning.test.js && node tests/v028Persistence.test.js && node tests/v029Security.test.js && node tests/v030Stability.test.js"
+    "test": "node tests/cleanupTrackers.test.js && node tests/scheduleSave.test.js && node tests/scamLink.test.js && node tests/duplicateSpam.test.js && node tests/v026Security.test.js && node tests/v027Learning.test.js && node tests/v028Persistence.test.js && node tests/v029Security.test.js && node tests/v030Stability.test.js && node tests/v031Escalation.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -335,6 +335,66 @@ async function warnUser(member, channel, reason, tag) {
     }
 }
 
+// ============ V0.3.1 高置信度漸進處置 ============
+// 設計原則：單一規則可能誤判（例如訊息一次 @ 3 個人是正常協作），
+// 多種獨立異常在短時間內連續觸發才是高置信度訊號。
+// 因此不再「單一規則直接 Ban」，改為：警告 → 禁言 → 封鎖 的漸進式處置。
+
+// 跨類型異常累積：10 分鐘內該使用者觸發的所有自動規則總數
+function countStrikes(userId, guildId) {
+    const now = Date.now();
+    let total = 0;
+    const suffix = `_${userId}_${guildId}`;
+    for (const [key, d] of trackers) {
+        if (key.startsWith('strike_') && key.endsWith(suffix) && d && now - (d.last || 0) <= 600000) {
+            total += d.count;
+        }
+    }
+    return total;
+}
+
+// 漸進式處置：
+//   一般訊號：第 1 次警告（禁言 10 分鐘）→ 10 分鐘內第 2 次禁言 1 小時 → 第 3 次封鎖
+//   強訊號（opts.strong）：明確惡意（詐騙連結/XSS/惡意檔案/撞庫），維持 2 次封鎖
+// 回傳 'warn' | 'timeout' | 'ban'
+async function escalatePunishment(member, channel, kind, reason, opts = {}) {
+    const uid = member.id, gid = member.guild.id;
+    if (opts.strong) {
+        const strikes = addStrike(uid, gid, kind);
+        if (strikes >= 2) return await banUser(member, `🐙 ${reason}（累犯 ${strikes} 次）`, kind, channel);
+        return await warnUser(member, channel, reason, kind);
+    }
+    addStrike(uid, gid, kind);
+    const total = countStrikes(uid, gid);
+    if (total >= 3) {
+        return await banUser(member, `🐙 ${reason}（多次異常 ${total} 次）`, kind, channel);
+    }
+    if (total >= 2) {
+        try { await member.timeout(3600000, `🐙 再次異常 - ${kind}`); } catch (_) {}
+        logAction('TIMEOUT', {
+            userId: uid,
+            userTag: member.user.tag,
+            guildId: gid,
+            guildName: member.guild.name,
+            reason: `${kind} - ${reason}`
+        });
+        console.log(`⏳ 禁言 1 小時 ${member.user.tag}: ${kind}`);
+        if (channel) {
+            try {
+                const embed = new EmbedBuilder()
+                    .setColor(0xff8800)
+                    .setTitle('⏳ 再次異常（未封鎖）')
+                    .setDescription(`**${member.user.tag}** 已被禁言 1 小時，再犯將被封鎖`)
+                    .addFields({ name: '原因', value: reason, inline: true })
+                    .setTimestamp();
+                await channel.send({ embeds: [embed] });
+            } catch (_) {}
+        }
+        return 'timeout';
+    }
+    return await warnUser(member, channel, reason, kind);
+}
+
 // ============ 間隔檢測 ============
 const trackers = new Map();
 
@@ -1636,12 +1696,7 @@ client.on(Events.PresenceUpdate, async (_, newP) => {
                         try {
                             const m = await g.members.fetch(newP.user.id);
                             if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                                const strikes = addStrike(newP.user.id, gid, 'richp');
-                                if (strikes >= 2) {
-                                    await banUser(m, `🐙 惡意 Rich Presence（累犯 ${strikes} 次）`, 'RichPresence');
-                                } else {
-                                    await warnUser(m, null, '狀態顯示含可疑注入樣式', 'RichPresence');
-                                }
+                                await escalatePunishment(m, null, 'RichPresence', '狀態顯示含可疑注入樣式');
                             }
                         } catch (_) {}
                     }
@@ -1669,7 +1724,7 @@ client.on(Events.MessageCreate, async (msg) => {
             try {
                 const m = await msg.guild.members.fetch(uid);
                 if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                    await banUser(m, `🐙 止損 - ${r.reason}`, '止損', msg.channel);
+                    await escalatePunishment(m, msg.channel, '止損', `止損 - ${r.reason}`);
                     await msg.delete().catch(() => {});
                 }
             } catch (_) {}
@@ -1687,7 +1742,7 @@ client.on(Events.MessageCreate, async (msg) => {
                 try {
                     const m = await msg.guild.members.fetch(uid);
                     if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                        await banUser(m, `🐙 @mention - ${r.reason}`, '@mention', msg.channel);
+                        await escalatePunishment(m, msg.channel, '@mention', `@mention - ${r.reason}`);
                         await msg.delete().catch(() => {});
                     }
                 } catch (_) {}
@@ -1704,7 +1759,7 @@ client.on(Events.MessageCreate, async (msg) => {
             try {
                 const m = await msg.guild.members.fetch(uid);
                 if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                    await banUser(m, `🐙 腳本 - ${r.reason}`, '腳本', msg.channel);
+                    await escalatePunishment(m, msg.channel, '腳本', `腳本 - ${r.reason}`);
                     await msg.delete().catch(() => {});
                 }
             } catch (_) {}
@@ -1719,7 +1774,7 @@ client.on(Events.MessageCreate, async (msg) => {
             try {
                 const m = await msg.guild.members.fetch(uid);
                 if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                    await banUser(m, `🐙 SelfBot - ${r.reason}`, 'SelfBot', msg.channel);
+                    await escalatePunishment(m, msg.channel, 'SelfBot', `SelfBot - ${r.reason}`);
                 }
             } catch (_) {}
         }
@@ -1733,7 +1788,7 @@ client.on(Events.MessageCreate, async (msg) => {
             try {
                 const m = await msg.guild.members.fetch(uid);
                 if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                    await banUser(m, `🐙 洪水 - ${r.reason}`, '洪水', msg.channel);
+                    await escalatePunishment(m, msg.channel, '洪水', `洪水 - ${r.reason}`);
                     await msg.delete().catch(() => {});
                 }
             } catch (_) {}
@@ -1778,12 +1833,7 @@ client.on(Events.MessageCreate, async (msg) => {
                     const m = await msg.guild.members.fetch(uid);
                     if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
                         await msg.delete().catch(() => {});
-                        const strikes = addStrike(uid, gid, 'scam');
-                        if (strikes >= 2) {
-                            await banUser(m, `🐙 詐騙連結（累犯 ${strikes} 次）`, '詐騙連結', msg.channel);
-                        } else {
-                            await warnUser(m, msg.channel, `偵測到可疑連結：${hit.reason}，訊息已刪除`, '詐騙連結');
-                        }
+                        await escalatePunishment(m, msg.channel, '詐騙連結', `偵測到可疑連結：${hit.reason}，訊息已刪除`, { strong: true });
                     }
                 } catch (_) {}
             }
@@ -1819,12 +1869,7 @@ client.on(Events.MessageCreate, async (msg) => {
             try {
                 const m = await msg.guild.members.fetch(uid);
                 if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                    const strikes = addStrike(uid, gid, 'dup');
-                    if (strikes >= 2) {
-                        await banUser(m, `🐙 重複內容（累犯 ${strikes} 次）`, '重複內容', msg.channel);
-                    } else {
-                        await warnUser(m, msg.channel, '短時間內重複發送相同內容', '重複內容');
-                    }
+                    await escalatePunishment(m, msg.channel, '重複內容', '短時間內重複發送相同內容');
                 }
             } catch (_) {}
         }
@@ -1876,12 +1921,7 @@ client.on(Events.MessageCreate, async (msg) => {
                 const m = await msg.guild.members.fetch(uid);
                 if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
                     await msg.delete().catch(() => {});
-                    const strikes = addStrike(uid, gid, 'xss');
-                    if (strikes >= 2) {
-                        await banUser(m, `🐙 XSS注入（累犯 ${strikes} 次）`, 'XSS', msg.channel);
-                    } else {
-                        await warnUser(m, msg.channel, '偵測到可疑的網頁注入樣式，訊息已刪除', 'XSS');
-                    }
+                    await escalatePunishment(m, msg.channel, 'XSS', '偵測到可疑的網頁注入樣式，訊息已刪除', { strong: true });
                 }
             } catch (_) {}
             return;
@@ -1903,7 +1943,7 @@ client.on(Events.MessageCreate, async (msg) => {
                     const m = await msg.guild.members.fetch(uid);
                     if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
                         await msg.delete().catch(() => {});
-                        await banUser(m, `🐙 惡意檔案: ${att.name}`, '惡意檔案', msg.channel);
+                        await escalatePunishment(m, msg.channel, '惡意檔案', `惡意檔案: ${att.name}`, { strong: true });
                     }
                 } catch (_) {}
                 return;
@@ -1925,7 +1965,7 @@ client.on(Events.VoiceStateUpdate, async (old, now) => {
         try {
             const m = old.member || now.member;
             if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                await banUser(m, `🐙 語音濫用 - ${r.reason}`, '語音濫用');
+                await escalatePunishment(m, null, '語音濫用', `語音濫用 - ${r.reason}`);
             }
         } catch (_) {}
     }
@@ -2087,7 +2127,7 @@ client.on(Events.GuildMemberAdd, async (m) => {
         if (r) {
             console.log(`⚠️ 撞庫: ${m.user.tag}`);
             try {
-                await banUser(m, `🐙 撞庫 - ${r.reason}`, '撞庫');
+                await escalatePunishment(m, null, '撞庫', `撞庫 - ${r.reason}`, { strong: true });
             } catch (_) {}
         }
     }
@@ -2128,7 +2168,7 @@ client.on(Events.InviteCreate, async (inv) => {
         try {
             const m = await inv.guild.members.fetch(inv.inviter.id);
             if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                await banUser(m, `🐙 邀請濫用 - ${r.reason}`, '邀請濫用');
+                await escalatePunishment(m, null, '邀請濫用', `邀請濫用 - ${r.reason}`);
             }
         } catch (_) {}
     }
