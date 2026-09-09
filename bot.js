@@ -916,8 +916,17 @@ function recordScamCandidate(host, meta = {}) {
     if (st.count >= 3 && (st.sources || []).length >= 2) {
         const blNow = loadBlacklist();
         blNow.scamDomains = blNow.scamDomains || [];
-        blNow.scamDomainMeta = blNow.scamDomainMeta || {};
+        blNow.scamDomainMeta = blNow.scamDomainMeta || [];
+        // V0.4.1：人工駁回防反彈——管理者駁回的域名 7 天內不自動提升（人工裁定優先於機器學習）
+        const rejMap = blNow.rejectedDomains || {};
+        if (rejMap[host] && Date.now() - rejMap[host].at < 7 * 86400000) {
+            delete cand[host]; // 駁回冷卻中：清掉候選，避免每日回合誤升
+            saveBlacklist(blNow);
+            return;
+        }
         if (!blNow.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
+            // V0.4.1：過冷卻再現警示——曾被駁回的域名再次大量出現，提醒管理者評估（可能是新型態或誤判持續）
+            if (rejMap[host] && typeof logAction === 'function') logAction('SCAM_REJECTED_AGAIN', { domain: host, reports: st.count });
             blNow.scamDomains.push(host);
             blNow.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: Date.now(), source: '自主學習', learnedAt: Date.now(), sources: st.sources || [], confirmed: true };
             if (typeof logAction === 'function') logAction('SCAM_LEARN', { domain: host, reports: st.count, confirmed: true, immediate: true });
@@ -1031,9 +1040,17 @@ function learnScamDomains() {
     let learned = 0, removed = 0, forgotten = 0;
     // 1) 自動提升：來源多樣性門檻——多伺服器共識（sources≥2）命中 ≥3 提升；單一來源需 ≥5（防單一伺服器灌水誤學）
     for (const [host, st] of Object.entries(candidates)) {
+        // V0.4.1：人工駁回防反彈——駁回 7 天內不自動提升（人工裁定優先於機器學習）
+        const rejMap2 = bl.rejectedDomains || {};
+        if (rejMap2[host] && now - rejMap2[host].at < 7 * 86400000) {
+            delete candidates[host]; // 駁回冷卻中：清掉候選，冷卻後重新觀察
+            continue;
+        }
         const multiSource = st.sources && st.sources.length >= 2;
         if (((multiSource && st.count >= 3) || (!multiSource && st.count >= 5))
             && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
+            // V0.4.1：過冷卻再現警示——曾被駁回的域名再次達標提升
+            if (rejMap2[host] && typeof logAction === 'function') logAction('SCAM_REJECTED_AGAIN', { domain: host, reports: st.count });
             bl.scamDomains.push(host);
             bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now, sources: st.sources || [], confirmed: !!multiSource };
             logAction('SCAM_LEARN', { domain: host, reports: st.count, confirmed: !!multiSource });
@@ -1794,11 +1811,15 @@ client.on(Events.InteractionCreate, async (i) => {
                     } else {
                         const domain = input.toLowerCase();
                         if (!blNow.scamDomains.includes(domain)) return i.followUp({ content: `ℹ️ \`${domain}\` 不在清單`, flags: 64 });
+                        // V0.4.1：駁回記錄——管理者裁定為誤學，7 天內不再自動提升（防反彈）
+                        blNow.rejectedDomains = blNow.rejectedDomains || {};
+                        blNow.rejectedDomains[domain] = { at: Date.now(), by: i.user.tag, guildId: gid };
+                        if (typeof logAction === 'function') logAction('SCAM_REJECT', { domain, by: i.user.tag, guildId: gid });
                         blNow.scamDomains = blNow.scamDomains.filter(d => d !== domain);
                         delete blNow.scamDomainMeta[domain];
                         saveBlacklist(blNow);
-                        logAdmin(i, '刪除詐騙域名', domain);
-                        await i.followUp({ content: `✅ 已刪除：\`${domain}\``, flags: 64 });
+                        logAdmin(i, '駁回詐騙域名（防反彈 7 天）', domain);
+                        await i.followUp({ content: `✅ 已駁回：\`${domain}\`（7 天內不再自動提升）`, flags: 64 });
                     }
                     await showScamPanel(i);
                     } finally {
