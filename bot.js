@@ -1,5 +1,6 @@
 require('dotenv').config();
 const fs = require('fs');
+const path = require('path');
 const { Client, GatewayIntentBits, Events, EmbedBuilder, ActionRowBuilder, ButtonBuilder, PermissionFlagsBits } = require('discord.js');
 
 const client = new Client({
@@ -16,9 +17,11 @@ const client = new Client({
 
 const DEVELOPER_ID = process.env.DEVELOPER_ID;
 
-const BLACKLIST_FILE = './blacklist.json';
-const CONFIG_FILE = './config.json';
-const LOG_FILE = './logs.json';
+// V0.3.0：資料檔一律以 __dirname 定位——從任何目錄啟動都不會寫錯位置
+const DATA_DIR = __dirname;
+const BLACKLIST_FILE = path.join(DATA_DIR, 'blacklist.json');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const LOG_FILE = path.join(DATA_DIR, 'logs.json');
 
 // ============ 工具函數 ============
 function loadJSON(file, fallback) {
@@ -406,6 +409,11 @@ function cleanupTrackers() {
             if (now >= (data.reset || 0)) trackers.delete(key);
             continue;
         }
+        // 面板限流（checkCmdRate）：{t}，逾 10 秒即刪除
+        if (key.startsWith('cmd_')) {
+            if (now - (data.t || 0) > 10000) trackers.delete(key);
+            continue;
+        }
         // 重複內容（checkDuplicate）：{msgs:[{t,h}], last}，逾 60 秒無活動刪除
         if (key.startsWith('dup_')) {
             data.msgs = (data.msgs || []).filter(m => now - (m && m.t) < 30000);
@@ -509,6 +517,34 @@ function isShortener(host) {
     return SHORTENER_DOMAINS.includes(host);
 }
 
+// V0.3.0：大量加入防護——60 秒內 ≥5 個新成員加入即回傳數量（防 raid 警示）
+function trackJoin(gid) {
+    const now = Date.now();
+    const k = `join_${gid}`;
+    const d = trackers.get(k) || { times: [], last: now };
+    d.times = d.times.filter(t => now - t < 60000);
+    d.times.push(now);
+    d.last = now;
+    trackers.set(k, d);
+    return d.times.length >= 5 ? d.times.length : 0;
+}
+
+// V0.3.0：純文字釣魚偵測——無連結的贈禮/驗證詐騙話術（僅警示，不刪除不處罰）
+function detectTextScam(content) {
+    const c = (content || '').toLowerCase();
+    const patterns = [
+        [/(?:free|claim|get|win)[\s-]+(?:discord\s+)?nitro/i, '免費 Nitro 話術'],
+        [/discord[\s-]+(?:nitro[\s-]+)?gift/i, 'Discord 贈禮話術'],
+        [/(?:steam|discord)[\s-]+gift[\s-]+(?:code|card)/i, '贈禮碼話術'],
+        [/verify[\s-]+(?:your|the)[\s-]+(?:account|server|discord)/i, '驗證帳號釣魚話術'],
+        [/\b(?:discordnitro|nitro\s+gift|free\s+nitro)\b/i, 'Nitro 關鍵字話術']
+    ];
+    for (const [p, reason] of patterns) {
+        if (p.test(c)) return reason;
+    }
+    return null;
+}
+
 // V0.2.9：Webhook 名稱假冒偵測（名稱仿冒 discord/steam/nitro 官方或贈禮）
 function isHookImpersonating(name) {
     const n = (name || '').toLowerCase();
@@ -521,8 +557,8 @@ function checkCmdRate(uid) {
     const now = Date.now();
     const k = `cmd_${uid}`;
     const last = trackers.get(k);
-    if (last && now - last < 5000) return false;
-    trackers.set(k, now);
+    if (last && now - (last.t || 0) < 5000) return false;
+    trackers.set(k, { t: now });
     return true;
 }
 
@@ -1755,6 +1791,26 @@ client.on(Events.MessageCreate, async (msg) => {
         }
     }
 
+    // V0.3.0：純文字釣魚偵測——無連結的贈禮/驗證話術，僅警示不刪除
+    if (sec.scamLink !== false) {
+        const txt = detectTextScam(msg.content);
+        const noUrl = !extractUrls(msg.content || '').length && !extractObfuscatedUrls(msg.content || '').length;
+        if (txt && noUrl) {
+            console.log(`⚠️ 文字釣魚: ${msg.author.tag} -> ${txt}`);
+            if (isAlertEnabled(gid, 'scamLink')) {
+                try {
+                    const embed = new EmbedBuilder()
+                        .setColor(0xffa500)
+                        .setTitle('⚠️ 釣魚話術')
+                        .setDescription(`**${msg.author.tag}** 發送疑似釣魚文字`)
+                        .addFields({ name: '原因', value: txt, inline: false })
+                        .setTimestamp();
+                    await sendAlert(gid, embed);
+                } catch (_) {}
+            }
+        }
+    }
+
     // 重複內容（V0.2.5）
     if (sec.duplicateSpam !== false) {
         const d = checkDuplicate(uid, gid, msg.content);
@@ -1978,6 +2034,20 @@ client.on(Events.GuildMemberAdd, async (m) => {
         }
     }
 
+    // V0.3.0：大量加入防護（raid 偵測）——僅警示，不自動處理，避免誤傷正常加入
+    const joinCount = trackJoin(gid);
+    if (joinCount >= 5 && isAlertEnabled(gid, 'suspiciousAccount')) {
+        try {
+            const embed = new EmbedBuilder()
+                .setColor(0xff0000)
+                .setTitle('🚨 大量成員加入')
+                .setDescription(`**${m.guild.name}** 在 60 秒內有 ${joinCount} 個新成員加入`)
+                .addFields({ name: 'ID', value: m.user.id, inline: true })
+                .setTimestamp();
+            await sendAlert(gid, embed);
+        } catch (_) {}
+    }
+
     if (sec.suspiciousAccount !== false) {
         const r = isSuspicious(m.user);
         if (r.suspicious && isAlertEnabled(gid, 'suspiciousAccount')) {
@@ -2161,9 +2231,11 @@ setInterval(async () => {
 function writeCrash(type, err) {
     const line = `[${new Date().toISOString()}] ${type}: ${err && err.stack ? err.stack : String(err)}\n`;
     console.error(type === 'uncaughtException' ? '💥' : '🚨', maskToken(err && err.message ? err.message : err));
-    try { fs.appendFileSync('./crash.log', maskToken(line)); } catch (_) {}
+    try { fs.appendFileSync(path.join(__dirname, 'crash.log'), maskToken(line)); } catch (_) {}
 }
 process.on('unhandledRejection', (reason) => { writeCrash('unhandledRejection', reason); });
+// V0.3.0：Discord 斷線/無效連線記錄（不退出，discord.js 會自行重連）
+client.on(Events.ShardDisconnect, (e, id) => writeCrash('shardDisconnect', (e && e.message ? e : new Error(`shard ${id} 斷線`))));
 process.on('uncaughtException', (err) => {
     writeCrash('uncaughtException', err);
     flushPendingWrites();
@@ -2200,6 +2272,16 @@ async function startBot() {
     }
 }
 if (!validateEnv()) process.exit(1);
+// V0.3.0：啟動自檢——顯示版本、平台與資料目錄，方便除錯定位
+try {
+    const pkg = require('./package.json');
+    console.log(`🐙 OctopCutes-Bot v${pkg.version} | 平台: ${process.platform} | Node: ${process.version} | 目錄: ${__dirname}`);
+} catch (_) {}
+// V0.3.0：記憶體可觀測性——每 6 小時記錄 RSS/heap，供每日維護比對記憶體趨勢
+setInterval(() => {
+    const mu = process.memoryUsage();
+    console.log(`📊 記憶體: ${(mu.rss / 1048576).toFixed(1)}MB RSS | ${(mu.heapUsed / 1048576).toFixed(1)}MB heap`);
+}, 6 * 60 * 60 * 1000);
 
 // ============ V0.2.6 啟動防護 ============
 // 單實例鎖：防止重複啟動雙實例同時操作設定檔/黑名單造成衝突
@@ -2226,7 +2308,7 @@ function releaseInstanceLock() {
 function checkEnvFilePerm() {
     if (process.platform === 'win32') return;
     try {
-        const st = fs.statSync('.env');
+        const st = fs.statSync(path.join(__dirname, '.env'));
         if (st.mode & 0o077) console.warn(`⚠️ .env 權限過寬 (${(st.mode & 0o777).toString(8)})，建議 chmod 600 .env`);
     } catch (_) {}
 }

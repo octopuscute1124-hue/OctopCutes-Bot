@@ -141,6 +141,31 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 
 ## :pencil: 更新日誌
 
+### V0.3.0（2026-09-09）— 穩定性・相容性・輕量化
+
+#### 🧭 路徑相容性（從任何目錄啟動皆穩定）
+- 所有資料檔（blacklist.json / config.json / logs.json / crash.log / .env 檢查）一律以 __dirname 定位，不再依賴工作目錄——Windows 開發與香橙派 systemd 執行環境皆一致
+
+#### 🛰️ 斷線偵測
+- 監聽 Discord ShardDisconnect：斷線記錄至 crash.log 供追查（不退出，discord.js 自動重連）
+
+#### 🧹 面板限流追蹤清理
+- checkCmdRate 改存物件、cleanupTrackers 新增 cmd_ 分支（逾 10 秒清理）——追蹤表不再殘留
+
+#### 🚨 大量加入防護（raid 偵測）
+- 60 秒內 ≥5 個新成員加入即發送警報（僅警示不自動處理，避免誤傷正常加入）
+
+#### 💬 純文字釣魚偵測
+- 無連結的贈禮/驗證詐騙話術（free nitro、discord gift、verify your account 等）——僅警示不刪除
+
+#### 📊 記憶體可觀測性
+- 每 6 小時記錄 RSS/heap 至日誌，供每日維護比對記憶體趨勢；啟動自檢顯示版本/平台/Node/目錄
+
+#### 🧪 測試
+- 新增 tests/v030Stability.test.js（大量加入/限流清理/文字釣魚/路徑硬化 25 項）；9 套件全部通過
+
+---
+
 ### V0.2.9（2026-09-09）— 極致安全（防繞過＋部署點硬化）
 
 #### 🔍 URL 混淆還原（防釣魚繞過）

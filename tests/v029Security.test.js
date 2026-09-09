@@ -65,7 +65,7 @@ const rate = new Function('trackers', block + `return checkCmdRate;`)(tr);
 check('首次允許', rate('u1'), true);
 check('5 秒內拒絕', rate('u1'), false);
 check('不同使用者互不影響', rate('u2'), true);
-tr.set('cmd_u1', Date.now() - 6000);
+tr.set('cmd_u1', { t: Date.now() - 6000 });
 check('超過 5 秒後允許', rate('u1'), true);
 
 // ===== isHookImpersonating：Webhook 名稱假冒 =====
