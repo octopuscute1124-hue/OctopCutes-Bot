@@ -94,7 +94,7 @@ check('不同使用者數=2', wr3.distinctUsers, 2);
 
 // ===== 6) recordScamCandidate 跨使用者加權 =====
 const rcStart = src.indexOf('function recordScamCandidate');
-const rcEnd = src.indexOf('// V0.3.6：連結觀察池');
+const rcEnd = src.indexOf('// V0.3.7：連結觀察池升級');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
 const shared = {};
 const rc = new Function(

@@ -906,15 +906,25 @@ function recordScamCandidate(host, meta = {}) {
     st.lastHit = Date.now();
     saveBlacklist(loadBlacklist());
 }
-// V0.3.6：連結觀察池——同一可疑連結被 ≥2 個「不同使用者」發送才算多人共識（記憶體，輕量）
-const linkWatch = new Map(); // host -> { users: Set, count, firstSeen }
-function watchLink(host, userId) {
+// V0.3.7：連結觀察池升級——10 分鐘窗內 ≥2 個「不同使用者」才構成群組共識（確認制：短時間多人＝高可信）
+// 低齡帳號（<7 天）參與者單獨統計——撞庫群常用新號，低齡參與越多越可疑
+const linkWatch = new Map(); // host -> { users: Map<uid, {ts, lowAge}>, count, firstSeen }
+function watchLink(host, userId, meta = {}) {
     const now = Date.now();
-    if (!linkWatch.has(host)) linkWatch.set(host, { users: new Set(), count: 0, firstSeen: now });
+    const WINDOW = 10 * 60 * 1000;
+    if (!linkWatch.has(host)) linkWatch.set(host, { users: new Map(), count: 0, firstSeen: now });
     const w = linkWatch.get(host);
-    w.users.add(userId);
+    // 過期使用者淡出（10 分鐘沒再發，視為不同事件）
+    for (const [uid, e] of w.users) { if (now - e.ts > WINDOW) w.users.delete(uid); }
+    w.users.set(userId, { ts: now, lowAge: !!meta.lowAge });
     w.count++;
-    return { hits: w.count, distinctUsers: w.users.size, consensus: w.count >= 2 && w.users.size >= 2 };
+    const users = [...w.users.values()];
+    return {
+        hits: w.count,
+        distinctUsers: w.users.size,
+        lowAgeCount: users.filter(e => e.lowAge).length,
+        consensus: w.users.size >= 2
+    };
 }
 
 // 域名格式驗證（防駭）：避免學習/新增注入怪異字串污染清單
@@ -977,10 +987,16 @@ function pruneScamCandidates() {
     const cand = getScamCandidates();
     const now = Date.now();
     let n = 0;
+    let decayed = 0;
     for (const [h, st] of Object.entries(cand)) {
+        // V0.3.7：記憶衰退——24 小時無新命中的候選熱度減半（誤學的域名自然淡出，不盲目維持高可信）
+        if (now - (st.lastHit || st.firstHit || 0) > 24 * 60 * 60 * 1000) {
+            const nc = Math.max(1, Math.floor((st.count || 1) / 2));
+            if (nc !== st.count) { st.count = nc; decayed++; }
+        }
         if (now - (st.lastHit || st.firstHit || 0) > 72 * 60 * 60 * 1000) { delete cand[h]; n++; }
     }
-    if (n > 0) saveBlacklist(loadBlacklist());
+    if (n > 0 || decayed > 0) saveBlacklist(loadBlacklist());
     return n;
 }
 function learnScamDomains() {
@@ -2070,7 +2086,22 @@ client.on(Events.MessageCreate, async (msg) => {
                         mm.hits = (mm.hits || 0) + 1;
                         mm.lastHit = Date.now();
                     } else if (hit.reason.includes('疑似偽裝') && isValidDomain(hitHost)) {
-                        const w = watchLink(hitHost, uid);
+                        const w = watchLink(hitHost, uid, {
+                            lowAge: (Date.now() - (msg.author.createdTimestamp || Date.now())) < 7 * 86400000
+                        });
+                        if (w.consensus) {
+                            // V0.3.7：群組撞庫——10 分鐘內多人發送同一仿冒連結，升為 collusion 重訊號（權重 4）
+                            try {
+                                const cm = await msg.guild.members.fetch(uid);
+                                if (!cm.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(cm)) {
+                                    await msg.delete().catch(() => {});
+                                    await escalatePunishment(cm, msg.channel, 'collusion',
+                                        `群組撞庫：${hitHost} 已由 ${w.distinctUsers} 個使用者發送${w.lowAgeCount ? `（含 ${w.lowAgeCount} 個新帳號）` : ''}，訊息已刪除`,
+                                        { strong: true });
+                                }
+                            } catch (_) {}
+                            return;
+                        }
                         recordScamCandidate(hitHost, {
                             guildId: gid,
                             accountAgeDays: (Date.now() - (msg.author.createdTimestamp || Date.now())) / 86400000,
