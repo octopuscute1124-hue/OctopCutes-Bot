@@ -45,7 +45,7 @@ const now = Date.now();
 {
   const domains = [];
   const meta = {};
-  const candidates = { 'discord-verify.xyz': { count: 3, firstHit: now - 1000, lastHit: now } };
+  const candidates = { 'discord-verify.xyz': { count: 3, firstHit: now - 1000, lastHit: now, sources: ['g1', 'g2'] } };
   const { learn, actions } = buildEnv(domains, meta, candidates);
   const r = learn();
   check('命中 3 次自動加入', domains.includes('discord-verify.xyz'), true);
@@ -110,7 +110,7 @@ const now = Date.now();
 {
   const domains = [];
   const meta = {};
-  const candidates = { 'steam-free.xyz': { count: 3, lastHit: now }, 'nitro-gift.xyz': { count: 3, lastHit: now } };
+  const candidates = { 'steam-free.xyz': { count: 3, lastHit: now, sources: ['g1', 'g2'] }, 'nitro-gift.xyz': { count: 3, lastHit: now, sources: ['g1', 'g2'] } };
   const { learn, bl } = buildEnv(domains, meta, candidates);
   const r = learn();
   check('學習後候選已清空', Object.keys(candidates).length, 0);

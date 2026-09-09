@@ -1006,13 +1006,15 @@ function learnScamDomains() {
     const candidates = getScamCandidates();
     const now = Date.now();
     let learned = 0, removed = 0, forgotten = 0;
-    // 1) 自動提升：候選命中 ≥3 次且非官方 → 提升為明確詐騙域名（學習後移除候選）
+    // 1) 自動提升：來源多樣性門檻——多伺服器共識（sources≥2）命中 ≥3 提升；單一來源需 ≥5（防單一伺服器灌水誤學）
     for (const [host, st] of Object.entries(candidates)) {
-        if (st.count >= 3 && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
+        const multiSource = st.sources && st.sources.length >= 2;
+        if (((multiSource && st.count >= 3) || (!multiSource && st.count >= 5))
+            && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
             bl.scamDomains.push(host);
-            bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now, sources: st.sources || [] };
-            logAction('SCAM_LEARN', { domain: host, reports: st.count });
-            console.log(`🧠 自主學習: ${host} 被命中 ${st.count} 次，已加入詐騙域名`);
+            bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now, sources: st.sources || [], confirmed: !!multiSource };
+            logAction('SCAM_LEARN', { domain: host, reports: st.count, confirmed: !!multiSource });
+            console.log(`🧠 自主學習: ${host} 被命中 ${st.count} 次（${multiSource ? '多伺服器確認' : '單一來源'}），已加入詐騙域名`);
             learned++;
             delete candidates[host];
             continue;
@@ -1021,6 +1023,21 @@ function learnScamDomains() {
         if (now - (st.lastHit || st.firstHit || 0) > 72 * 60 * 60 * 1000) {
             delete candidates[host];
             forgotten++;
+        }
+    }
+    // V0.3.8：二次確認——單一來源提升者 24h 內若無任何新命中（hits=0），降級回候選（觀察期未被證實）
+    // 多來源（confirmed）已具跨伺服器共識，不需二次確認
+    let unconfirmed = 0;
+    for (const d of [...bl.scamDomains]) {
+        const meta = bl.scamDomainMeta[d];
+        if (meta && meta.source === '自主學習' && !meta.confirmed && meta.learnedAt
+            && now - meta.learnedAt >= 24 * 60 * 60 * 1000 && !(meta.hits > 0)) {
+            bl.scamDomains = bl.scamDomains.filter(x => x !== d);
+            delete bl.scamDomainMeta[d];
+            candidates[d] = candidates[d] || { count: meta.reports || 1, firstHit: now, lastHit: now, sources: meta.sources || [] };
+            logAction('SCAM_UNCONFIRMED', { domain: d });
+            console.log(`🧠 自主學習: ${d} 24 小時內無新命中，降級回候選（未經二次確認）`);
+            unconfirmed++;
         }
     }
     // 2) 低置信移除
@@ -1034,9 +1051,9 @@ function learnScamDomains() {
             removed++;
         }
     }
-    if (learned || removed || forgotten) saveBlacklist(bl);
-    console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}、老化清除 ${forgotten}`);
-    return { learned, removed, forgotten };
+    if (learned || removed || forgotten || unconfirmed) saveBlacklist(bl);
+    console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}、老化清除 ${forgotten}、降級 ${unconfirmed}`);
+    return { learned, removed, forgotten, unconfirmed };
 }
 // 每 24 小時執行一次學習回合
 setInterval(() => { try { learnScamDomains(); } catch (e) { console.error('學習失敗:', e.message); } }, 24 * 60 * 60 * 1000);
