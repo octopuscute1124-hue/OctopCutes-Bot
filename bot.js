@@ -959,6 +959,27 @@ function watchLink(host, userId, meta = {}) {
     };
 }
 
+// V0.4.2：低齡帳號先行警示——新帳號（<7 天）發送候選詐騙連結（未證實）時，
+// 不刪除不封鎖（避免誤傷），改為警報頻道通知管理員審核＋建立候選學習記錄
+async function lowAgeScamAlert(guild, author, hitUrl, host, w, gid) {
+    if (!w || !(w.lowAgeCount >= 1)) return false;
+    if (!isAlertEnabled(gid, 'scamLink')) return false;
+    try {
+        const embed = new EmbedBuilder()
+            .setColor(0xffa500)
+            .setTitle('⚠️ 低齡帳號發送可疑連結')
+            .setDescription(`**${author.tag}**（新帳號）發送了疑似仿冒連結`)
+            .addFields(
+                { name: '連結', value: String(hitUrl || '').slice(0, 120), inline: false },
+                { name: '域名', value: host, inline: true },
+                { name: '共識', value: `${w.distinctUsers} 個使用者發送（含 ${w.lowAgeCount} 個新帳號）`, inline: true }
+            )
+            .setTimestamp();
+        await sendAlert(gid, embed);
+        return true;
+    } catch (_) { return false; }
+}
+
 // 域名格式驗證（防駭）：避免學習/新增注入怪異字串污染清單
 function isValidDomain(host) {
     if (typeof host !== 'string') return false;
@@ -1106,9 +1127,11 @@ async function reportLearning(summary = {}) {
         const now = Date.now();
         const immediate = [];
         const bl = loadBlacklist();
+        const rejHist = bl.rejectedDomains || {};
         for (const [host, meta] of Object.entries(bl.scamDomainMeta || {})) {
             if (meta.learnedAt && now - meta.learnedAt < 86400000 && meta.source === '自主學習') {
-                immediate.push({ host, reports: meta.reports || 0, confirmed: !!meta.confirmed });
+                // V0.4.2：曾被駁回卻再次被提升的域名標記「再現」——管理者可直接在彙報看到
+                immediate.push({ host, reports: meta.reports || 0, confirmed: !!meta.confirmed, rejectedAgain: !!rejHist[host] });
             }
         }
         const total = (summary.learned || 0) + (summary.removed || 0) + (summary.forgotten || 0) + (summary.unconfirmed || 0);
@@ -1124,7 +1147,7 @@ async function reportLearning(summary = {}) {
                 { name: '降級回候選', value: `${summary.unconfirmed || 0} 個`, inline: true }
             );
         if (immediate.length) {
-            embed.addFields({ name: '⚡ 近 24h 即時封鎖（爆發）', value: immediate.map(x => `${x.host}（${x.reports} 命中${x.confirmed ? '・多來源' : ''}）`).join('\n').slice(0, 900) || '無' });
+            embed.addFields({ name: '⚡ 近 24h 即時封鎖（爆發）', value: immediate.map(x => `${x.host}（${x.reports} 命中${x.confirmed ? '・多來源' : ''}${x.rejectedAgain ? '・曾被駁回再現' : ''}）`).join('\n').slice(0, 900) || '無' });
         }
         for (const guild of client.guilds.cache.values()) {
             await sendAlert(guild.id, embed);
@@ -2212,6 +2235,8 @@ client.on(Events.MessageCreate, async (msg) => {
                             accountAgeDays: (Date.now() - (msg.author.createdTimestamp || Date.now())) / 86400000,
                             senderCount: w.distinctUsers
                         });
+                        // V0.4.2：低齡帳號先行警示——候選連結由新帳號發送時通知管理員審核
+                        try { await lowAgeScamAlert(msg.guild, msg.author, hit.url, hitHost, w, gid); } catch (_) {}
                     }
                 } catch (_) {}
                 console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
