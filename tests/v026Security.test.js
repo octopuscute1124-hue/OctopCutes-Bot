@@ -69,7 +69,9 @@ check('近期 mention_ 保留', trackers.has('mention_u3'), true);
 const code = [
   grab(/const SCAM_DOMAINS = \[[\s\S]*?\];/, 'SCAM_DOMAINS'),
   grab(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/, 'OFFICIAL_DOMAINS'),
+  grab(/const SHORTENER_DOMAINS = \[[\s\S]*?\];/, 'SHORTENER_DOMAINS'),
   grab(/function getScamReason\(url\) \{[\s\S]*?\r?\n\}/, 'getScamReason'),
+  grab(/function isShortener\(host\) \{[\s\S]*?\r?\n\}/, 'isShortener'),
   'return getScamReason;'
 ].join('\n');
 const getScamReason = new Function('loadBlacklist', code)(() => ({ scamDomains: ['evil-test.com', 'phish.example'] }));

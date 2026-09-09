@@ -13,10 +13,12 @@ function grab(pattern, label) {
 const code = [
   grab(/const SCAM_DOMAINS = \[[\s\S]*?\];/, 'SCAM_DOMAINS'),
   grab(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/, 'OFFICIAL_DOMAINS'),
+  grab(/const SHORTENER_DOMAINS = \[[\s\S]*?\];/, 'SHORTENER_DOMAINS'),
   grab(/function extractUrls\(content\) \{[\s\S]*?\r?\n\}/, 'extractUrls'),
   grab(/function getScamReason\(url\) \{[\s\S]*?\r?\n\}/, 'getScamReason'),
+  grab(/function isShortener\(host\) \{[\s\S]*?\r?\n\}/, 'isShortener'),
   grab(/function isImpersonating\(user\) \{[\s\S]*?\r?\n\}/, 'isImpersonating'),
-  'return { SCAM_DOMAINS, OFFICIAL_DOMAINS, extractUrls, getScamReason, isImpersonating };'
+  'return { SCAM_DOMAINS, OFFICIAL_DOMAINS, SHORTENER_DOMAINS, extractUrls, getScamReason, isShortener, isImpersonating };'
 ].join('\n');
 
 const mod = new Function(code)();

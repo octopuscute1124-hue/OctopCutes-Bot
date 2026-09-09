@@ -465,6 +465,67 @@ const OFFICIAL_DOMAINS = [
     'minecraft.net', 'epicgames.com', 'xbox.com', 'playstation.com', 'nintendo.com'
 ];
 
+const SHORTENER_DOMAINS = [
+    'bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'is.gd', 'cutt.ly', 'rb.gy', 's.id',
+    'shorturl.at', 'tiny.cc', 'ow.ly', 'buff.ly', 'rebrand.ly', 'short.link', 'ur0.link', 'u.nu'
+];
+
+// V0.2.9：網址混淆還原——還原 hxxp://、[.]、(.)、{ . }、全形點、空格、零寬字元等繞過手法
+function normalizeLink(url) {
+    let u = (url || '')
+        .replace(/[\[\{\(]\s*\.\s*[\]\}\)]/g, '.')
+        .replace(/[．。]/g, '.')
+        .replace(/\s+/g, '')
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '');
+    u = u.replace(/^hxxps?:\/\//i, (m) => (/^hxxps/i.test(m) ? 'https://' : 'http://'));
+    return u;
+}
+
+// V0.2.9：抓取使用混淆手法的可疑網址（hxxp 前綴、[.]、(.)、全形點、空格分隔＋釣魚關鍵字）
+function extractObfuscatedUrls(content) {
+    const out = [];
+    const c = (content || '');
+    // hxxp/hXXp 混淆協議
+    out.push(...(c.match(/hxxps?:\/\/[^\s<>"']+/gi) || []));
+    // 明確混淆點符號：[.]、(.)、{ . }、．、。
+    out.push(...(c.match(/[\w-]+(?:\s*[\[\{\(]\s*\.\s*[\]\}\)]\s*|\s*[．。]\s*)[\w.-]+/gi) || []));
+    // 空格分隔混淆（discord . com）：僅在含釣魚關鍵字時抓取，避免誤判正常文字
+    out.push(...(c.match(/[\w-]+(?:\s+\.\s+)+[\w.-]+/gi) || []).filter(x => /(discord|steam|nitro|gift|verify|airdrop|free)/i.test(x)));
+    // 去重：以主機名為鍵（帶協議與不帶協議視為同一網址，保留先捕獲的完整版）
+    const seen = new Set();
+    const res = [];
+    for (const u of out) {
+        const nu = normalizeLink(u);
+        const key = nu.replace(/^https?:\/\//i, '');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        res.push(nu);
+    }
+    return res;
+}
+
+// V0.2.9：短網址服務判定（無法確認真實目標，僅記錄與警示）
+function isShortener(host) {
+    return SHORTENER_DOMAINS.includes(host);
+}
+
+// V0.2.9：Webhook 名稱假冒偵測（名稱仿冒 discord/steam/nitro 官方或贈禮）
+function isHookImpersonating(name) {
+    const n = (name || '').toLowerCase();
+    return /(discord|steam|nitro)[\s_-]*(nitro|gift|giveaway|free|airdrop|mod|staff|admin|system|verify|verification|support)/.test(n) ||
+        /(nitro|gift)[\s_-]*(free|giveaway|code)/.test(n);
+}
+
+// V0.2.9：面板指令限流（每使用者 5 秒 1 次，防濫發）
+function checkCmdRate(uid) {
+    const now = Date.now();
+    const k = `cmd_${uid}`;
+    const last = trackers.get(k);
+    if (last && now - last < 5000) return false;
+    trackers.set(k, now);
+    return true;
+}
+
 function extractUrls(content) {
     const re = /https?:\/\/[^\s<>"']+/gi;
     return (content.match(re) || []).map(u => u.replace(/[),.;!?]+$/, ''));
@@ -475,6 +536,8 @@ function getScamReason(url) {
         const u = new URL(url);
         const host = u.hostname.toLowerCase();
         if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return 'IP 直連連結';
+        // V0.2.9：短網址服務——無法確認真實目標，標記風險
+        if (isShortener(host)) return `短網址服務 (${host})`;
         const isOfficial = OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o));
         if (isOfficial) return null;
         // V0.2.6：管理員自訂詐騙域名（blacklist.scamDomains）；loadBlacklist 失敗時略過此檢查
@@ -749,6 +812,8 @@ client.on(Events.MessageCreate, async (msg) => {
         const bf = checkBruteForce(msg.author.id);
         if (!bf.allowed) return msg.reply(`⚠️ ${bf.reason}`);
     }
+    // V0.2.9：面板指令限流（每使用者 5 秒 1 次）
+    if (!checkCmdRate(msg.author.id)) return msg.reply('⏳ 操作太頻繁，請 5 秒後再試');
     await showPanel(msg);
 });
 
@@ -1639,36 +1704,53 @@ client.on(Events.MessageCreate, async (msg) => {
         }
     }
 
-    // 詐騙連結（V0.2.5）
+    // 詐騙連結（V0.2.5；V0.2.9 加入混淆網址還原與短網址偵測）
     if (sec.scamLink !== false) {
-        const urls = extractUrls(msg.content || '');
-        const hit = urls.map(u => ({ url: u, reason: getScamReason(u) })).find(x => x.reason);
+        const rawUrls = [...extractUrls(msg.content || ''), ...extractObfuscatedUrls(msg.content || '')];
+        const hit = rawUrls.map(u => ({ url: u, reason: getScamReason(u) })).find(x => x.reason);
         if (hit) {
-            // V0.2.7：自主學習統計——自訂域名累計命中次數；偽官方域名進學習池
-            try {
-                const hitHost = new URL(hit.url).hostname.toLowerCase();
-                const blNow = loadBlacklist();
-                if ((blNow.scamDomains || []).includes(hitHost)) {
-                    const mm = (blNow.scamDomainMeta = blNow.scamDomainMeta || {})[hitHost] = (blNow.scamDomainMeta[hitHost] || { hits: 0 });
-                    mm.hits = (mm.hits || 0) + 1;
-                    mm.lastHit = Date.now();
-                } else if (hit.reason.includes('疑似偽裝') && isValidDomain(hitHost)) {
-                    recordScamCandidate(hitHost);
+            // V0.2.9：短網址服務僅記錄與警示，不刪除訊息（避免誤刪合法短連結）
+            if (hit.reason.startsWith('短網址')) {
+                console.log(`📎 短網址: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
+                if (isAlertEnabled(gid, 'scamLink')) {
+                    try {
+                        const embed = new EmbedBuilder()
+                            .setColor(0xffa500)
+                            .setTitle('📎 短網址偵測')
+                            .setDescription(`**${msg.author.tag}** 發送了短網址連結`)
+                            .addFields({ name: '連結', value: hit.url.slice(0, 120), inline: false })
+                            .addFields({ name: '原因', value: hit.reason, inline: false })
+                            .setTimestamp();
+                        await sendAlert(gid, embed);
+                    } catch (_) {}
                 }
-            } catch (_) {}
-            console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
-            try {
-                const m = await msg.guild.members.fetch(uid);
-                if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
-                    await msg.delete().catch(() => {});
-                    const strikes = addStrike(uid, gid, 'scam');
-                    if (strikes >= 2) {
-                        await banUser(m, `🐙 詐騙連結（累犯 ${strikes} 次）`, '詐騙連結', msg.channel);
-                    } else {
-                        await warnUser(m, msg.channel, `偵測到可疑連結：${hit.reason}，訊息已刪除`, '詐騙連結');
+            } else {
+                // V0.2.7：自主學習統計——自訂域名累計命中次數；偽官方域名進學習池
+                try {
+                    const hitHost = new URL(hit.url).hostname.toLowerCase();
+                    const blNow = loadBlacklist();
+                    if ((blNow.scamDomains || []).includes(hitHost)) {
+                        const mm = (blNow.scamDomainMeta = blNow.scamDomainMeta || {})[hitHost] = (blNow.scamDomainMeta[hitHost] || { hits: 0 });
+                        mm.hits = (mm.hits || 0) + 1;
+                        mm.lastHit = Date.now();
+                    } else if (hit.reason.includes('疑似偽裝') && isValidDomain(hitHost)) {
+                        recordScamCandidate(hitHost);
                     }
-                }
-            } catch (_) {}
+                } catch (_) {}
+                console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);
+                try {
+                    const m = await msg.guild.members.fetch(uid);
+                    if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
+                        await msg.delete().catch(() => {});
+                        const strikes = addStrike(uid, gid, 'scam');
+                        if (strikes >= 2) {
+                            await banUser(m, `🐙 詐騙連結（累犯 ${strikes} 次）`, '詐騙連結', msg.channel);
+                        } else {
+                            await warnUser(m, msg.channel, `偵測到可疑連結：${hit.reason}，訊息已刪除`, '詐騙連結');
+                        }
+                    }
+                } catch (_) {}
+            }
             return;
         }
     }
@@ -1800,6 +1882,18 @@ client.on(Events.WebhookUpdate, async (ch) => {
     try {
         const hooks = await ch.fetchWebhooks();
         const recent = hooks.filter(w => Date.now() - w.createdTimestamp < 60000);
+        // V0.2.9：Webhook 名稱假冒偵測（仿冒 discord/steam/nitro 官方或贈禮）
+        for (const w of recent) {
+            if (isHookImpersonating(w.name) && isAlertEnabled(gid, 'webhookAbuse')) {
+                const embed = new EmbedBuilder()
+                    .setColor(0xff0000)
+                    .setTitle('⚠️ 假冒 Webhook')
+                    .setDescription(`偵測到名稱仿冒官方的 Webhook：**${w.name}**`)
+                    .addFields({ name: '頻道', value: `<#${ch.id}>`, inline: true })
+                    .setTimestamp();
+                await sendAlert(gid, embed);
+            }
+        }
         if (recent.size > 3 && isAlertEnabled(gid, 'webhookAbuse')) {
             const embed = new EmbedBuilder()
                 .setColor(0xff0000)

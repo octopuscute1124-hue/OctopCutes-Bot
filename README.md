@@ -141,6 +141,35 @@ Windows 使用者也可以直接執行附帶的 `start.bat`（請先修改內部
 
 ## :pencil: 更新日誌
 
+### V0.2.9（2026-09-09）— 極致安全（防繞過＋部署點硬化）
+
+#### 🔍 URL 混淆還原（防釣魚繞過）
+- 還原 hxxp://、[.]、(.)、{ . }、全形點、空格、零寬字元等混淆手法後再檢查，繞過手法無所遁形
+- 空格分隔混淆（discord . com）僅在含釣魚關鍵字時偵測，避免誤判正常文字
+
+#### 📎 短網址服務偵測
+- 辨識 bit.ly、tinyurl.com、goo.gl 等 16 個短網址服務：無法確認真實目標時記錄並發送警示，不誤刪合法短連結
+
+#### ⏳ 面板指令限流
+- !章魚 面板每使用者 5 秒限 1 次，防管理指令被濫發
+
+#### 🕸️ Webhook 名稱假冒偵測
+- 偵測名稱仿冒 discord/steam/nitro 官方或贈禮關鍵字的 Webhook 並發送警報
+
+#### 🏰 部署點安全硬化（香橙派）
+- SSH：停用密碼登入、root 僅限金鑰（prohibit-password）、最大 3 次認證嘗試、閒置逾時
+- 防火牆 ufw：預設拒絕所有流入，僅允許區域網路（192.168.0.0/24）SSH
+- fail2ban：SSH 暴力破解自動封鎖
+- 自動安全更新：unattended-upgrades 每日檢查安全更新
+- systemd 服務隔離：NoNewPrivileges、PrivateTmp、ProtectSystem=full、RestrictSUIDSGID、RestrictRealtime、LockPersonality
+- 記憶體上限：MemoryHigh=200M / MemoryMax=300M（與 03:00 隨機重啟互補，防記憶體溢出拖垮系統）
+- 硬化腳本 harden_pi.sh（冪等、可重跑、套用前自動備份）
+
+#### 🧪 測試
+- 新增 tests/v029Security.test.js（混淆還原/短網址/限流/假冒偵測 36 項）；8 套件全部通過
+
+---
+
 ### V0.2.8（2026-09-09）— 學習持久化與防駭強化
 
 #### 🧠 詐騙學習候選池持久化（重啟不丟學習進度）
