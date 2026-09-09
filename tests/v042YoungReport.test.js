@@ -24,10 +24,14 @@ function buildAlert() {
     const sent = [];
     const embed = { fields: [], setColor() { return this; }, setTitle(t) { this.title = t; return this; }, setDescription(d) { this.description = d; return this; }, setTimestamp() { return this; }, addFields(...fs) { this.fields.push(...fs); return this; } };
     const EmbedBuilder = class { constructor() { return embed; } };
-    const fn = new Function('isAlertEnabled', 'sendAlert', 'EmbedBuilder', laCode + '; return lowAgeScamAlert;')(
-        (gid, feat) => true, async (gid, emb) => { sent.push({ gid, emb }); }, EmbedBuilder
+    const lowAgeReview = new Map();
+    const lowAgeCtx = { n: 0 };
+    const ButtonBuilder = class { constructor() { return this; } setCustomId(id) { this.id = id; return this; } setLabel(l) { this.label = l; return this; } setStyle(st) { this.style = st; return this; } };
+    const ActionRowBuilder = class { constructor() { return this; } addComponents(...cs) { this.components = cs; return this; } };
+    const fn = new Function('isAlertEnabled', 'sendAlert', 'EmbedBuilder', 'ActionRowBuilder', 'ButtonBuilder', 'lowAgeReview', 'lowAgeCtx', laCode + '; return lowAgeScamAlert;')(
+        (gid, feat) => true, async (gid, emb, row) => { sent.push({ gid, emb, row }); }, EmbedBuilder, ActionRowBuilder, ButtonBuilder, lowAgeReview, lowAgeCtx
     );
-    return { fn, sent, embed };
+    return { fn, sent, embed, lowAgeReview };
 }
 
 (async () => {
@@ -42,6 +46,22 @@ function buildAlert() {
     check('描述含帳號', embed.description.includes('新帳號#1234'), true);
     check('欄位含域名', embed.fields.some(f => f.name === '域名' && f.value === 'evil.xyz'), true);
     check('欄位含共識', embed.fields.some(f => f.name === '共識' && f.value.includes('3 個使用者')), true);
+}
+
+// 場景 1b：審核按鈕（V0.4.3）
+{
+    const { fn, sent, lowAgeReview } = buildAlert();
+    const ok = await fn({ name: '測試' }, { tag: '新帳號#1234' }, 'http://evil.xyz/link', 'evil.xyz',
+        { lowAgeCount: 1, distinctUsers: 2 }, 'g1');
+    check('產生審核按鈕仍觸發', ok, true);
+    check('審核記錄已建立', lowAgeReview.size, 1);
+    const rec = lowAgeReview.values().next().value;
+    check('審核記錄含域名', rec.host, 'evil.xyz');
+    check('審核記錄含伺服器', rec.guildId, 'g1');
+    const row = sent[0] && sent[0].row;
+    check('送出 ActionRow', row !== undefined, true);
+    check('按鈕含確認釣魚', row && row.components && row.components.some(c => c.label === '✅ 確認釣魚' && c.style === 4), true);
+    check('按鈕含放行', row && row.components && row.components.some(c => c.label === '❌ 放行' && c.style === 2), true);
 }
 
 // 場景 2：lowAgeCount=0（非低齡）→ 不警示

@@ -219,12 +219,12 @@ function isAlertEnabled(guildId, feature) {
     return a[feature] !== undefined ? a[feature] : true;
 }
 
-async function sendAlert(guildId, embed) {
+async function sendAlert(guildId, embed, components = null) {
     const cid = config.alertChannel[guildId];
     const guild = client.guilds.cache.get(guildId);
     if (!guild) return;
     const channel = cid ? guild.channels.cache.get(cid) : guild.systemChannel;
-    if (channel) await channel.send({ embeds: [embed] });
+    if (channel) await channel.send({ embeds: [embed], components: components || [] });
 }
 
 // ============ 日誌 ============
@@ -959,6 +959,10 @@ function watchLink(host, userId, meta = {}) {
     };
 }
 
+// V0.4.3：低齡審核——customId 對應實際域名（Map 防 customId 100 字元長度限制）
+const lowAgeReview = new Map(); // token -> { host, guildId, userId, url }
+const lowAgeCtx = { n: 0 };
+
 // V0.4.2：低齡帳號先行警示——新帳號（<7 天）發送候選詐騙連結（未證實）時，
 // 不刪除不封鎖（避免誤傷），改為警報頻道通知管理員審核＋建立候選學習記錄
 async function lowAgeScamAlert(guild, author, hitUrl, host, w, gid) {
@@ -975,9 +979,39 @@ async function lowAgeScamAlert(guild, author, hitUrl, host, w, gid) {
                 { name: '共識', value: `${w.distinctUsers} 個使用者發送（含 ${w.lowAgeCount} 個新帳號）`, inline: true }
             )
             .setTimestamp();
-        await sendAlert(gid, embed);
+        // V0.4.3：審核按鈕——管理員一鍵「確認釣魚」或「放行」
+        const token = 'la' + (++lowAgeCtx.n);
+        lowAgeReview.set(token, { host, guildId: gid, userId: (author && author.id) || null, url: hitUrl || null });
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('laok_' + token).setLabel('✅ 確認釣魚').setStyle(4),
+            new ButtonBuilder().setCustomId('lano_' + token).setLabel('❌ 放行').setStyle(2)
+        );
+        await sendAlert(gid, embed, row);
         return true;
     } catch (_) { return false; }
+}
+
+// V0.4.3：低齡審核執行——approve=true 確認釣魚（加入黑名單）；false 放行（駁回＋清候選）
+function applyLowAgeReview(host, gid, approve, by) {
+    const blNow = loadBlacklist();
+    blNow.scamDomains = blNow.scamDomains || [];
+    blNow.scamDomainMeta = blNow.scamDomainMeta || {};
+    if (approve) {
+        if (blNow.scamDomains.includes(host) || OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
+            return { ok: false, msg: '已在清單或官方域名' };
+        }
+        blNow.scamDomains.push(host);
+        blNow.scamDomainMeta[host] = { reports: 1, hits: 0, addedAt: Date.now(), source: '管理員審核', learnedAt: Date.now(), confirmed: true, reviewedBy: by };
+        if (typeof logAction === 'function') logAction('SCAM_LEARN', { domain: host, confirmed: true, by: '管理員審核' });
+        saveBlacklist(blNow);
+        return { ok: true, msg: '已確認釣魚並加入黑名單' };
+    }
+    blNow.rejectedDomains = blNow.rejectedDomains || {};
+    blNow.rejectedDomains[host] = { at: Date.now(), by, guildId: gid, source: '管理員審核' };
+    if (blNow.scamCandidateStats && blNow.scamCandidateStats[host]) delete blNow.scamCandidateStats[host];
+    saveBlacklist(blNow);
+    if (typeof logAction === 'function') logAction('SCAM_REJECT', { domain: host, by, source: '管理員審核' });
+    return { ok: true, msg: '已放行並記錄駁回（7 天防反彈）' };
 }
 
 // 域名格式驗證（防駭）：避免學習/新增注入怪異字串污染清單
@@ -1149,6 +1183,16 @@ async function reportLearning(summary = {}) {
         if (immediate.length) {
             embed.addFields({ name: '⚡ 近 24h 即時封鎖（爆發）', value: immediate.map(x => `${x.host}（${x.reports} 命中${x.confirmed ? '・多來源' : ''}${x.rejectedAgain ? '・曾被駁回再現' : ''}）`).join('\n').slice(0, 900) || '無' });
         }
+        // V0.4.3：學習品質指標——近 30 天提升 vs 駁回（機器人自我校準可見）
+        let learn30 = 0, reject30 = 0;
+        const cutoff = now - 30 * 86400000;
+        for (const meta of Object.values(bl.scamDomainMeta || {})) {
+            if (meta.learnedAt && meta.learnedAt >= cutoff) learn30++;
+        }
+        for (const rj of Object.values(bl.rejectedDomains || {})) {
+            if (rj.at && rj.at >= cutoff) reject30++;
+        }
+        embed.addFields({ name: '📊 近 30 天學習品質', value: `提升 ${learn30} ・駁回 ${reject30}${reject30 > 0 ? `（駁回率 ${Math.round(reject30 * 100 / Math.max(1, learn30 + reject30))}%）` : ''}`, inline: false });
         for (const guild of client.guilds.cache.values()) {
             await sendAlert(guild.id, embed);
         }
@@ -1720,6 +1764,19 @@ client.on(Events.InteractionCreate, async (i) => {
                     saveConfig();
                     logAdmin(i, '警報切換', `${key}->${a[key] ? '啟用' : '關閉'}`);
                     await showAlertPanel(i);
+                    break;
+                }
+                // V0.4.3：低齡審核一鍵回報（確認釣魚/放行）
+                if (i.customId.startsWith('laok_') || i.customId.startsWith('lano_')) {
+                    if (i.user.id !== DEVELOPER_ID && !canApproveGlobalBan(i)) return i.reply({ content: '⛔ 僅管理員可審核', flags: 64 });
+                    const token = i.customId.slice(5);
+                    const rec = lowAgeReview.get(token);
+                    if (!rec) return i.reply({ content: '⏰ 此審核已過期或已處理', flags: 64 });
+                    lowAgeReview.delete(token);
+                    const approve = i.customId.startsWith('laok_');
+                    const r = applyLowAgeReview(rec.host, rec.guildId, approve, i.user.tag);
+                    if (linkWatch.has(rec.host)) linkWatch.delete(rec.host); // 放行/確認後清觀察池，避免重複警示
+                    await i.reply({ content: `${r.ok ? '✅' : 'ℹ️'} ${r.msg}：\`${rec.host}\``, flags: 64 });
                     break;
                 }
                 // 黑名單/白名單操作
