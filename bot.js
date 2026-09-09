@@ -367,6 +367,11 @@ async function warnUser(member, channel, reason, tag) {
 // 而是「訊號權重 × 時間半衰期」的風險累積：行為越重權重越高、越近的異常影響越大，
 // 正常使用者偶發行為會隨時間自然歸零，持續異常者分數指數累積快速升級。
 
+// V0.3.5：累犯偵測——30 天內有 BAN 紀錄的使用者（記憶體緩衝，輕量）
+function isKnownOffender(userId) {
+    return logsBuffer.some(l => l.action === 'BAN' && l.details && l.details.userId === userId);
+}
+
 // 半衰期 10 分鐘：異常發生後影響力每 10 分鐘減半
 const RISK_HALF_LIFE = 10 * 60 * 1000;
 // 訊號權重：強訊號（明確惡意）權重高；輕訊號（易誤判，如 @mention/重複）權重低
@@ -386,10 +391,11 @@ function getRiskScore(userId, guildId) {
     return d.score * Math.pow(0.5, elapsed / RISK_HALF_LIFE);
 }
 
-// 累加風險：分數 = 衰減後殘留分數 + 本次訊號權重
+// 累加風險：分數 = 衰減後殘留分數 + 本次訊號權重 + 累犯加成（V0.3.5：有 BAN 紀錄者再犯門檻更低）
 function addRisk(userId, guildId, kind) {
     const w = SIGNAL_WEIGHTS[kind] || 1;
-    const score = getRiskScore(userId, guildId) + w;
+    const offenderBonus = isKnownOffender(userId) ? 1 : 0;
+    const score = getRiskScore(userId, guildId) + w + offenderBonus;
     trackers.set(`risk_${userId}_${guildId}`, { score, last: Date.now() });
     return score;
 }
@@ -848,10 +854,22 @@ function getScamCandidates() {
     return bl.scamCandidateStats;
 }
 // 命中「疑似偽裝官方」時累計候選計數並立即寫入黑名單檔（輕量持久化）
-function recordScamCandidate(host) {
+// V0.3.5 智慧加權：跨伺服器共識＋新帳號關聯＋仿冒官方，都會提高單次命中權重——
+// 學習不是盲目數次數，而是「誰、在哪、長得像什麼」都納入信心
+function recordScamCandidate(host, meta = {}) {
     const cand = getScamCandidates();
-    const st = cand[host] = cand[host] || { count: 0, firstHit: Date.now(), lastHit: Date.now() };
-    st.count++;
+    const st = cand[host] = cand[host] || { count: 0, firstHit: Date.now(), lastHit: Date.now(), sources: [] };
+    let gain = 1;
+    // 跨伺服器共識：同一域名出現在不同伺服器 → 每多一個來源加權（多群人看到更可信）
+    if (meta.guildId && !st.sources.includes(meta.guildId)) {
+        if (st.sources.length < 10) st.sources.push(meta.guildId);
+        if (st.sources.length >= 2) gain++;
+    }
+    // 新帳號關聯：發送者帳號 < 7 天（高風險群體）→ 加權
+    if (typeof meta.accountAgeDays === 'number' && meta.accountAgeDays < 7) gain++;
+    // 仿冒官方：與官方域名相似的 typosquat → 加權（模仿官方拼寫是明確仿冒意圖）
+    if (isTyposquatOf(host)) gain++;
+    st.count += gain;
     st.lastHit = Date.now();
     saveBlacklist(loadBlacklist());
 }
@@ -864,6 +882,43 @@ function isValidDomain(host) {
     if (h.includes('..')) return false;
     return true;
 }
+// V0.3.5：編輯距離——輕量 Levenshtein 實作（僅在詐騙命中/候選評估時呼叫，頻率低）
+function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+        const cur = [i];
+        for (let j = 1; j <= n; j++) {
+            cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        }
+        prev = cur;
+    }
+    return prev[n];
+}
+
+// V0.3.5：仿冒官方域名偵測——編輯距離 ≤2，或含官方核心名＋額外字元（disc0rd.com、discord-verify.com）
+const OFFICIAL_BRANDS = ['discord', 'steam', 'github', 'gitlab', 'youtube', 'twitch', 'twitter', 'facebook',
+    'instagram', 'tiktok', 'reddit', 'medium', 'notion', 'google', 'microsoft', 'apple', 'spotify', 'netflix',
+    'amazon', 'paypal', 'wikipedia', 'stackoverflow', 'npm', 'nodejs', 'python', 'mozilla', 'cloudflare',
+    'vercel', 'netlify', 'replit', 'glitch', 'codepen', 'roblox', 'minecraft', 'epicgames', 'xbox',
+    'playstation', 'nintendo'];
+
+// V0.3.5：仿冒官方域名偵測——編輯距離 ≤2，或含官方品牌名＋額外字元（disc0rd.com、discord-verify.com、steamgift.net）
+function isTyposquatOf(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!isValidDomain(h)) return false;
+    if (OFFICIAL_DOMAINS.some(o => h === o || h.endsWith('.' + o))) return false;
+    for (const o of OFFICIAL_DOMAINS) {
+        if (levenshtein(h, o) <= 2) return true;
+    }
+    for (const brand of OFFICIAL_BRANDS) {
+        if (h.includes(brand) || h.replace(/[^a-z0-9]/g, '').includes(brand)) return true;
+    }
+    return false;
+}
+
 // 清除超過 72 小時未命中的過期候選（記憶體高水位時呼叫）
 function pruneScamCandidates() {
     const cand = getScamCandidates();
@@ -886,7 +941,7 @@ function learnScamDomains() {
     for (const [host, st] of Object.entries(candidates)) {
         if (st.count >= 3 && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
             bl.scamDomains.push(host);
-            bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now };
+            bl.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: now, source: '自主學習', learnedAt: now, sources: st.sources || [] };
             logAction('SCAM_LEARN', { domain: host, reports: st.count });
             console.log(`🧠 自主學習: ${host} 被命中 ${st.count} 次，已加入詐騙域名`);
             learned++;
@@ -1962,7 +2017,10 @@ client.on(Events.MessageCreate, async (msg) => {
                         mm.hits = (mm.hits || 0) + 1;
                         mm.lastHit = Date.now();
                     } else if (hit.reason.includes('疑似偽裝') && isValidDomain(hitHost)) {
-                        recordScamCandidate(hitHost);
+                        recordScamCandidate(hitHost, {
+                            guildId: gid,
+                            accountAgeDays: (Date.now() - (msg.author.createdTimestamp || Date.now())) / 86400000
+                        });
                     }
                 } catch (_) {}
                 console.log(`⚠️ 詐騙連結: ${msg.author.tag} -> ${hit.url.slice(0, 80)}`);

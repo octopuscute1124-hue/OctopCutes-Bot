@@ -19,15 +19,17 @@ function check(label, actual, expected) {
 }
 
 const getCandCode = grab(/function getScamCandidates\(\) \{[\s\S]*?\r?\n\}/, 'getScamCandidates');
-const recordCode = grab(/function recordScamCandidate\(host\) \{[\s\S]*?\r?\n\}/, 'recordScamCandidate');
+const recordCode = grab(/function recordScamCandidate\(host, meta = \{\}\) \{[\s\S]*?\r?\n\}/, 'recordScamCandidate');
 const validCode = grab(/function isValidDomain\(host\) \{[\s\S]*?\r?\n\}/, 'isValidDomain');
 const pruneCode = grab(/function pruneScamCandidates\(\) \{[\s\S]*?\r?\n\}/, 'pruneScamCandidates');
 
 function buildRecord(bl) {
   const actions = [];
-  const record = new Function('loadBlacklist', 'saveBlacklist', [getCandCode, recordCode, 'return recordScamCandidate;'].join('\n'))(
+  // V0.3.5：recordScamCandidate 已加入智慧加權（仿冒/跨伺服器/新帳號）——此處注入 isTyposquatOf mock 以維持「基礎計數」測試語義（加權行為由 v035 涵蓋）
+  const record = new Function('loadBlacklist', 'saveBlacklist', 'isTyposquatOf', [getCandCode, recordCode, 'return recordScamCandidate;'].join('\n'))(
     () => bl,
-    (d) => actions.push(['save'])
+    (d) => actions.push(['save']),
+    () => false
   );
   return { record, actions, bl };
 }

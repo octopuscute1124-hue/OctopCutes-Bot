@@ -15,7 +15,7 @@ function check(name, actual, expected) {
 }
 
 // 抓取風險評分 + 漸進處置連續區塊（含 RISK_HALF_LIFE 宣告）
-const escStart = src.indexOf('const RISK_HALF_LIFE');
+const escStart = src.indexOf('function isKnownOffender');
 const escEnd = src.indexOf('// ============ 間隔檢測 ============');
 if (escStart === -1 || escEnd === -1 || escEnd <= escStart) {
     console.error('❌ 找不到風險評分函式區塊');
@@ -29,7 +29,7 @@ const FakeDate = class { static now() { return fakeNow; } };
 // ===== getRiskScore：時間衰減 =====
 const tr1 = new Map();
 tr1.set('risk_u1_g1', { score: 100, last: fakeNow });
-const rs = new Function('trackers', 'Date', block + '; return { getRiskScore, addRisk };')(tr1, FakeDate);
+const rs = new Function('trackers', 'Date', 'logsBuffer', block + '; return { getRiskScore, addRisk };')(tr1, FakeDate, []);
 check('未衰減時保持原分', rs.getRiskScore('u1', 'g1'), 100);
 fakeNow += 10 * 60 * 1000; // 過一個半衰期
 check('過一個半衰期減半', rs.getRiskScore('u1', 'g1'), 50);
@@ -48,7 +48,7 @@ const member = {
     timeout: async (ms, reason) => { calls.timeout++; calls.timeoutMs = ms; calls.timeoutReason = reason; }
 };
 const esc = new Function(
-    'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction',
+    'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction', 'logsBuffer',
     block + '; return { escalatePunishment, addRisk };'
 )(tr2, FakeDate,
     (uid, gid, kind) => {
@@ -74,7 +74,7 @@ const esc = new Function(
     },
     async (m, ch, reason, tag) => { calls.warn++; calls.warnReason = `${tag} - ${reason}`; return 'warn'; },
     async (m, reason, kind, ch) => { calls.ban++; calls.banReason = reason; return 'ban'; },
-    (t, d) => calls.logs.push([t, d])
+    (t, d) => calls.logs.push([t, d]), []
 );
 
 (async () => {
@@ -101,7 +101,7 @@ const esc = new Function(
     const tr3 = new Map();
     const calls2 = { ban: 0, warn: 0, timeout: 0 };
     const esc2 = new Function(
-        'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction',
+        'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction', 'logsBuffer',
         block + '; return escalatePunishment;'
     )(tr3, FakeDate,
         (uid, gid, kind) => {
@@ -127,7 +127,7 @@ const esc = new Function(
         },
         async () => { calls2.warn++; return 'warn'; },
         async (m, reason) => { calls2.ban++; calls2.banReason = reason; return 'ban'; },
-        () => {}
+        () => {}, []
     );
     let l1 = await esc2(member, null, 'mention', 'mention - 測試');
     check('輕訊號 1 次 → 警告', l1, 'warn');
@@ -142,7 +142,7 @@ const esc = new Function(
     const tr4 = new Map();
     const calls3 = { ban: 0, warn: 0 };
     const esc3 = new Function(
-        'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction',
+        'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction', 'logsBuffer',
         block + '; return escalatePunishment;'
     )(tr4, FakeDate,
         (uid, gid, kind) => {
@@ -157,7 +157,7 @@ const esc = new Function(
         () => 0, () => 0,
         async () => { calls3.warn++; return 'warn'; },
         async (m, reason) => { calls3.ban++; calls3.banReason = reason; return 'ban'; },
-        () => {}
+        () => {}, []
     );
     let s1 = await esc3(member, null, '詐騙連結', '詐騙連結測試', { strong: true });
     check('強訊號第 1 次 → 警告', s1, 'warn');
@@ -170,7 +170,7 @@ const esc = new Function(
     const tr5 = new Map();
     tr5.set('risk_u1_g1', { score: 2, last: fakeNow });
     const esc4 = new Function(
-        'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction',
+        'trackers', 'Date', 'addStrike', 'addRisk', 'getRiskScore', 'warnUser', 'banUser', 'logAction', 'logsBuffer',
         block + '; return escalatePunishment;'
     )(tr5, FakeDate,
         () => 1,
@@ -188,7 +188,7 @@ const esc = new Function(
         },
         async () => { calls.warn++; return 'warn'; },
         async () => { calls.ban++; return 'ban'; },
-        () => {}
+        () => {}, []
     );
     fakeNow += 10 * 60 * 1000; // 過半衰期：2 分 → 1 分
     let d1 = await esc4(member, null, 'mention', '衰減測試');

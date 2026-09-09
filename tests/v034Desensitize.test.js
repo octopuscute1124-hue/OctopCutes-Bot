@@ -48,7 +48,7 @@ const riskBlock = src.slice(rStart, rEnd);
 const tr = new Map();
 let fakeNow = 1700000000000;
 const FakeDate = class { static now() { return fakeNow; } };
-const risk = new Function('trackers', 'Date', riskBlock + '; return { getRiskScore, addRisk, SIGNAL_WEIGHTS };')(tr, FakeDate);
+const risk = new Function('trackers', 'Date', 'logsBuffer', 'isKnownOffender', riskBlock + '; return { getRiskScore, addRisk, SIGNAL_WEIGHTS };')(tr, FakeDate, [], () => false);
 check('權重表存在', risk.SIGNAL_WEIGHTS.scam, 3);
 check('惡意檔案權重最高', risk.SIGNAL_WEIGHTS.maliciousFile, 4);
 check('易誤判訊號權重最低', risk.SIGNAL_WEIGHTS.mention, 1);
@@ -62,7 +62,7 @@ fakeNow += 10 * 60 * 1000;
 check('半衰期後衰減', risk.getRiskScore('u1', 'g1') < 3, true);
 fakeNow = 1700000000000;
 const tr2 = new Map();
-const risk2 = new Function('trackers', 'Date', riskBlock + '; return { getRiskScore, addRisk };')(tr2, FakeDate);
+const risk2 = new Function('trackers', 'Date', 'logsBuffer', 'isKnownOffender', riskBlock + '; return { getRiskScore, addRisk };')(tr2, FakeDate, [], () => false);
 risk2.addRisk('u9', 'g9', 'maliciousFile');
 check('單次惡意檔案 4 分', risk2.getRiskScore('u9', 'g9'), 4);
 
