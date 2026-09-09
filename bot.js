@@ -424,10 +424,17 @@ function addRisk(userId, guildId, kind, meta = {}) {
 // 回傳 'warn' | 'timeout' | 'ban'
 async function escalatePunishment(member, channel, kind, reason, opts = {}) {
     const uid = member.id, gid = member.guild.id;
+    // V0.3.9：低齡警示標記——低信任帳號（<7 天）的警告附註，管理員與成員一目了然
+    let tierNote = '';
+    try {
+        const t = getTrustTier(member);
+        if (t.tier === 'low') tierNote = '（⚠️ 新帳號，低信任）';
+        else if (t.tier === 'high') tierNote = '（高信任成員）';
+    } catch (_) {}
     if (opts.strong) {
         const strikes = addStrike(uid, gid, kind);
         if (strikes >= 2) return await banUser(member, `🐙 ${reason}（累犯 ${strikes} 次）`, kind, channel);
-        return await warnUser(member, channel, reason, kind);
+        return await warnUser(member, channel, reason + tierNote, kind);
     }
     const trustMultiplier = (opts.meta && typeof opts.meta.trustMultiplier === 'number')
         ? opts.meta.trustMultiplier
@@ -459,7 +466,7 @@ async function escalatePunishment(member, channel, kind, reason, opts = {}) {
         }
         return 'timeout';
     }
-    return await warnUser(member, channel, reason, kind);
+    return await warnUser(member, channel, reason + tierNote, kind);
 }
 
 // ============ V0.3.2 全域黑名單管理員同意制 ============
@@ -904,6 +911,22 @@ function recordScamCandidate(host, meta = {}) {
     if (typeof meta.senderCount === 'number' && meta.senderCount >= 2) gain++;
     st.count += gain;
     st.lastHit = Date.now();
+    // V0.3.9：爆發式即時提升——多來源共識且 count≥3 立即升級為正式詐騙域名（不等每日學習回合）
+    // 釣魚域名在爆發期（短時間多伺服器/多人中招）需要即時封鎖，延遲 24h 會讓更多人受害
+    if (st.count >= 3 && (st.sources || []).length >= 2) {
+        const blNow = loadBlacklist();
+        blNow.scamDomains = blNow.scamDomains || [];
+        blNow.scamDomainMeta = blNow.scamDomainMeta || {};
+        if (!blNow.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
+            blNow.scamDomains.push(host);
+            blNow.scamDomainMeta[host] = { reports: st.count, hits: 0, addedAt: Date.now(), source: '自主學習', learnedAt: Date.now(), sources: st.sources || [], confirmed: true };
+            if (typeof logAction === 'function') logAction('SCAM_LEARN', { domain: host, reports: st.count, confirmed: true, immediate: true });
+            console.log(`🧠 自主學習（即時）: ${host} 多來源共識 ${st.count} 次，立即加入詐騙域名`);
+            delete cand[host];
+            saveBlacklist(blNow);
+            return;
+        }
+    }
     saveBlacklist(loadBlacklist());
 }
 // V0.3.7：連結觀察池升級——10 分鐘窗內 ≥2 個「不同使用者」才構成群組共識（確認制：短時間多人＝高可信）
@@ -1051,7 +1074,11 @@ function learnScamDomains() {
             removed++;
         }
     }
-    if (learned || removed || forgotten || unconfirmed) saveBlacklist(bl);
+    if (learned || removed || forgotten || unconfirmed) {
+        saveBlacklist(bl);
+        // V0.3.9：學習摘要日誌——管理員可查詢每回合學習的具體變動
+        if (typeof logAction === 'function') logAction('SCAM_SUMMARY', { learned, removed, forgotten, unconfirmed });
+    }
     console.log(`🧠 學習回合完成: 新增 ${learned}、移除 ${removed}、老化清除 ${forgotten}、降級 ${unconfirmed}`);
     return { learned, removed, forgotten, unconfirmed };
 }

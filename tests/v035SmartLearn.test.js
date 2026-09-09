@@ -43,24 +43,28 @@ const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// 域名格式驗證');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
 const shared = {};
+const bl = { scamDomains: [], scamDomainMeta: {} };
 const rc = new Function(
-    'getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf',
+    'getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'OFFICIAL_DOMAINS', 'logAction',
     src.slice(rcStart, rcEnd) + '; return recordScamCandidate;'
 )(
-    () => shared, () => {}, () => ({}),
-    (h) => h === 'disc0rd.com'
+    () => shared, () => {}, () => bl,
+    (h) => h === 'disc0rd.com',
+    ['discord.com', 'discord.gg'], () => {}
 );
 rc('example-scam.com', { guildId: 'g1', accountAgeDays: 100 });
 check('一般候選單次 +1', shared['example-scam.com'].count, 1);
 rc('example-scam.com', { guildId: 'g1', accountAgeDays: 100 });
 check('同來源重複不加成', shared['example-scam.com'].count, 2);
 rc('example-scam.com', { guildId: 'g2', accountAgeDays: 100 });
-check('跨伺服器共識加成（+2）', shared['example-scam.com'].count, 4);
+check('跨伺服器共識加成達 4（V0.3.9 即時提升）', bl.scamDomainMeta['example-scam.com'].reports, 4);
+check('多來源 count≥3 即時提升（V0.3.9）', bl.scamDomains.includes('example-scam.com'), true);
+check('即時提升後候選移除', shared['example-scam.com'] === undefined, true);
+check('提升 meta 記錄多來源', bl.scamDomainMeta['example-scam.com'].sources.length, 2);
 rc('newbie-scam.com', { guildId: 'g1', accountAgeDays: 2 });
 check('新帳號關聯加成（+2）', shared['newbie-scam.com'].count, 2);
 rc('disc0rd.com', { guildId: 'g1', accountAgeDays: 100 });
 check('仿冒官方加成（+2）', shared['disc0rd.com'].count, 2);
-check('來源記錄', Array.isArray(shared['example-scam.com'].sources) && shared['example-scam.com'].sources.length, 2);
 
 // ===== isKnownOffender / addRisk 累犯加成 =====
 const oStart = src.indexOf('function isKnownOffender');

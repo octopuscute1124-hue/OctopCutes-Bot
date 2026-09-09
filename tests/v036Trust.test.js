@@ -97,14 +97,16 @@ const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// V0.3.7：連結觀察池升級');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
 const shared = {};
+const bl = { scamDomains: [], scamDomainMeta: {} };
 const rc = new Function(
-    'getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf',
+    'getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'OFFICIAL_DOMAINS', 'logAction',
     src.slice(rcStart, rcEnd) + '; return recordScamCandidate;'
-)(() => shared, () => {}, () => ({}), () => false);
+)(() => shared, () => {}, () => bl, () => false, ['discord.com', 'discord.gg'], () => {});
 rc('multi-scam.com', { guildId: 'g1', accountAgeDays: 100, senderCount: 1 });
 check('單一發送者不加權', shared['multi-scam.com'].count, 1);
 rc('multi-scam.com', { guildId: 'g2', accountAgeDays: 100, senderCount: 2 });
-check('跨使用者共識加成（基礎1+跨服1+多人1）', shared['multi-scam.com'].count, 4);
+check('跨使用者共識加成達 4（V0.3.9 即時提升）', bl.scamDomainMeta['multi-scam.com'].reports, 4);
+check('多來源 count≥3 即時提升（V0.3.9）', bl.scamDomains.includes('multi-scam.com'), true);
 
 console.log(`\n========== ${fail === 0 ? '全部通過' : '有失敗'}（${pass} 通過 / ${fail} 失敗）==========`);
 process.exit(fail === 0 ? 0 : 1);
