@@ -17,6 +17,7 @@ function check(name, actual, expected) {
 const om = src.match(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/);
 if (!om) { console.error('❌ 找不到 OFFICIAL_DOMAINS'); process.exit(1); }
 const officialCode = om[0];
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// V0.3.7：連結觀察池升級');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
@@ -26,7 +27,7 @@ const rcCode = src.slice(rcStart, rcEnd);
 function buildRecord(shared, bl) {
     const actions = [];
     const record = new Function('getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'logAction',
-        [officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
+        [tierCode, officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
         () => shared, (d) => actions.push(['save']), () => bl, () => false,
         (t, d) => actions.push([t, d])
     );
@@ -127,7 +128,7 @@ function buildRecord(shared, bl) {
     const bl = { scamDomains: [], scamDomainMeta: {}, scamCandidateStats: candidates };
     const actions = [];
     const learn = new Function('Date', 'loadBlacklist', 'saveBlacklist', 'logAction',
-        [officialCode, candCode, learnCode, 'return learnScamDomains;'].join('\n'))(
+        [tierCode, officialCode, candCode, learnCode, 'return learnScamDomains;'].join('\n'))(
         FakeDate, () => bl, (d) => { actions.push(['save']); }, (t, d) => actions.push([t, d])
     );
     const r = learn();

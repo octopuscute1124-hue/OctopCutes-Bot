@@ -22,7 +22,8 @@ function check(label, actual, expected) {
 const official = grab(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/, 'OFFICIAL_DOMAINS');
 const candCode = grab(/function getScamCandidates\(\) \{[\s\S]*?\r?\n\}/, 'getScamCandidates');
 const learnCode = grab(/function learnScamDomains\(\) \{[\s\S]*?\r?\n\}/, 'learnScamDomains');
-const code = [official, candCode, learnCode, 'return learnScamDomains;'].join('\n');
+const tierCode = grab(/function assessLearningTier[\s\S]*?\r?\n\}/, 'assessLearningTier');
+const code = [tierCode, official, candCode, learnCode, 'return learnScamDomains;'].join('\n');
 
 // 建立學習環境：注入 loadBlacklist/saveBlacklist/logAction
 // loadBlacklist 必須回傳同一共享物件（模擬真實 blacklistCache），

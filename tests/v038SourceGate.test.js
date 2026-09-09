@@ -18,6 +18,7 @@ function check(name, actual, expected) {
 const om = src.match(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/);
 if (!om) { console.error('❌ 找不到 OFFICIAL_DOMAINS'); process.exit(1); }
 const officialCode = om[0];
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const candStart = src.indexOf('function getScamCandidates');
 const candEnd = src.indexOf('function recordScamCandidate');
 const candCode = src.slice(candStart, candEnd);
@@ -34,7 +35,7 @@ function buildEnv(domains, meta, candidates) {
     const bl = { scamDomains: domains, scamDomainMeta: meta, scamCandidateStats: candidates };
     const actions = [];
     const learn = new Function('Date', 'loadBlacklist', 'saveBlacklist', 'logAction',
-        [officialCode, candCode, learnCode, 'return learnScamDomains;'].join('\n'))(
+        [tierCode, officialCode, candCode, learnCode, 'return learnScamDomains;'].join('\n'))(
         FakeDate, () => bl, (d) => { actions.push(['save']); }, (t, d) => actions.push([t, d])
     );
     return { learn, actions, bl };

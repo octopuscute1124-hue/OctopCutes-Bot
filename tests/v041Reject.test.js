@@ -23,6 +23,7 @@ const now = 1700000000000;
 const FakeDate = class { static now() { return now; } };
 
 // ===== 1) 爆發提升防反彈（recordScamCandidate）=====
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// V0.3.7：連結觀察池升級');
 const rcCode = src.slice(rcStart, rcEnd);
@@ -30,7 +31,7 @@ const rcCode = src.slice(rcStart, rcEnd);
 function buildRecord(shared, bl) {
     const actions = [];
     const record = new Function('getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'logAction', 'Date',
-        [officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
+        [tierCode, officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
         () => shared, (d) => actions.push(['save']), () => bl, () => false,
         (t, d) => actions.push([t, d]), FakeDate
     );
@@ -80,7 +81,7 @@ const csCode = src.slice(csStart, csEnd);
 function buildLearn(bl) {
     const actions = [];
     const learn = new Function('Date', 'loadBlacklist', 'saveBlacklist', 'logAction', 'getScamCandidates',
-        [officialCode, csCode, lsCode, 'return learnScamDomains;'].join('\n'))(
+        [tierCode, officialCode, csCode, lsCode, 'return learnScamDomains;'].join('\n'))(
         FakeDate, () => bl, (d) => { actions.push(['save']); }, (t, d) => actions.push([t, d]), () => bl.scamCandidateStats || {}
     );
     return { learn, actions, bl };

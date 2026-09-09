@@ -14,6 +14,7 @@ function check(name, actual, expected) {
     }
 }
 
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const rStart = src.indexOf('async function reportLearning');
 const rEnd = src.indexOf('// 每 24 小時執行一次學習回合');
 if (rStart === -1 || rEnd === -1) { console.error('❌ 找不到 reportLearning'); process.exit(1); }
@@ -25,7 +26,7 @@ function buildEnv(bl, guildIds) {
     // 共用 embed 物件（new 回傳同一個），fields 累積供斷言
     const embed = { fields: [], color: 0, title: '', description: '', setColor(c) { this.color = c; return this; }, setTitle(t) { this.title = t; return this; }, setDescription(d) { this.description = d; return this; }, setTimestamp() { return this; }, addFields(...fs) { this.fields.push(...fs); return this; } };
     const EmbedBuilder = class { constructor() { return embed; } };
-    const report = new Function('loadBlacklist', 'sendAlert', 'EmbedBuilder', 'client', rCode + '; return reportLearning;')(
+    const report = new Function('loadBlacklist', 'sendAlert', 'EmbedBuilder', 'client', tierCode + rCode + '; return reportLearning;')(
         () => bl, async (gid, emb) => { sent.push({ gid, emb }); }, EmbedBuilder, client
     );
     return { report, sent, embed };

@@ -911,10 +911,12 @@ function recordScamCandidate(host, meta = {}) {
     if (typeof meta.senderCount === 'number' && meta.senderCount >= 2) gain++;
     st.count += gain;
     st.lastHit = Date.now();
-    // V0.3.9：爆發式即時提升——多來源共識且 count≥3 立即升級為正式詐騙域名（不等每日學習回合）
-    // 釣魚域名在爆發期（短時間多伺服器/多人中招）需要即時封鎖，延遲 24h 會讓更多人受害
-    if (st.count >= 3 && (st.sources || []).length >= 2) {
-        const blNow = loadBlacklist();
+    // V0.3.9：爆發式即時提升——多來源共識立即升級為正式詐騙域名（不等每日學習回合）
+    // V0.4.4：爆發門檻也依學習品質動態調整（strict 需 5 次、tight 需 4 次、normal 需 3 次）
+    const blNow0 = loadBlacklist();
+    const burstThreshold = assessLearningTier(blNow0) === 'strict' ? 5 : assessLearningTier(blNow0) === 'tight' ? 4 : 3;
+    if (st.count >= burstThreshold && (st.sources || []).length >= 2) {
+        const blNow = blNow0;
         blNow.scamDomains = blNow.scamDomains || [];
         blNow.scamDomainMeta = blNow.scamDomainMeta || [];
         // V0.4.1：人工駁回防反彈——管理者駁回的域名 7 天內不自動提升（人工裁定優先於機器學習）
@@ -1086,14 +1088,38 @@ function pruneScamCandidates() {
     if (n > 0 || decayed > 0) saveBlacklist(loadBlacklist());
     return n;
 }
+// V0.4.4：學習品質自我校準——近 30 天提升 vs 駁回率決定學習門檻等級
+// normal：駁回率 ≤10%（學得好，維持標準門檻）；tight：10~30%（收緊一級）；strict：>30%（嚴格）
+// 樣本 <3 筆不調整（避免小樣本誤判）
+function assessLearningTier(bl) {
+    const cutoff = Date.now() - 30 * 86400000;
+    let learn30 = 0, reject30 = 0;
+    for (const meta of Object.values(bl.scamDomainMeta || {})) {
+        if (meta.learnedAt && meta.learnedAt >= cutoff) learn30++;
+    }
+    for (const rj of Object.values(bl.rejectedDomains || {})) {
+        if (rj.at && rj.at >= cutoff) reject30++;
+    }
+    const total = learn30 + reject30;
+    if (total < 3) return 'normal';
+    const rate = reject30 / total;
+    if (rate > 0.3) return 'strict';
+    if (rate > 0.1) return 'tight';
+    return 'normal';
+}
+
 function learnScamDomains() {
     const bl = loadBlacklist();
     bl.scamDomains = bl.scamDomains || [];
-    bl.scamDomainMeta = bl.scamDomainMeta || {};
+    bl.scamDomainMeta = bl.scamDomainMeta || [];
     const candidates = getScamCandidates();
     const now = Date.now();
     let learned = 0, removed = 0, forgotten = 0;
-    // 1) 自動提升：來源多樣性門檻——多伺服器共識（sources≥2）命中 ≥3 提升；單一來源需 ≥5（防單一伺服器灌水誤學）
+    // 1) 自動提升：來源多樣性門檻——V0.4.4 動態門檻（依學習品質自我校準）
+    // normal：多來源 ≥3／單一 ≥5；tight：多來源 ≥4／單一 ≥6；strict：多來源 ≥5／單一 ≥8
+    const tierNow = assessLearningTier(bl);
+    const multiThreshold = tierNow === 'strict' ? 5 : tierNow === 'tight' ? 4 : 3;
+    const singleThreshold = tierNow === 'strict' ? 8 : tierNow === 'tight' ? 6 : 5;
     for (const [host, st] of Object.entries(candidates)) {
         // V0.4.1：人工駁回防反彈——駁回 7 天內不自動提升（人工裁定優先於機器學習）
         const rejMap2 = bl.rejectedDomains || {};
@@ -1102,7 +1128,7 @@ function learnScamDomains() {
             continue;
         }
         const multiSource = st.sources && st.sources.length >= 2;
-        if (((multiSource && st.count >= 3) || (!multiSource && st.count >= 5))
+        if (((multiSource && st.count >= multiThreshold) || (!multiSource && st.count >= singleThreshold))
             && !bl.scamDomains.includes(host) && !OFFICIAL_DOMAINS.some(o => host === o || host.endsWith('.' + o))) {
             // V0.4.1：過冷卻再現警示——曾被駁回的域名再次達標提升
             if (rejMap2[host] && typeof logAction === 'function') logAction('SCAM_REJECTED_AGAIN', { domain: host, reports: st.count });
@@ -1193,6 +1219,9 @@ async function reportLearning(summary = {}) {
             if (rj.at && rj.at >= cutoff) reject30++;
         }
         embed.addFields({ name: '📊 近 30 天學習品質', value: `提升 ${learn30} ・駁回 ${reject30}${reject30 > 0 ? `（駁回率 ${Math.round(reject30 * 100 / Math.max(1, learn30 + reject30))}%）` : ''}`, inline: false });
+        // V0.4.4：當前學習門檻等級（自我校準狀態）
+        const tierLabel = assessLearningTier(bl) === 'strict' ? '🔒 嚴格（多來源 5 次）' : assessLearningTier(bl) === 'tight' ? '🔧 收緊（多來源 4 次）' : '✅ 標準（多來源 3 次）';
+        embed.addFields({ name: '🔧 學習門檻', value: tierLabel, inline: false });
         for (const guild of client.guilds.cache.values()) {
             await sendAlert(guild.id, embed);
         }

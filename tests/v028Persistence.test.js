@@ -20,13 +20,14 @@ function check(label, actual, expected) {
 
 const getCandCode = grab(/function getScamCandidates\(\) \{[\s\S]*?\r?\n\}/, 'getScamCandidates');
 const recordCode = grab(/function recordScamCandidate\(host, meta = \{\}\) \{[\s\S]*?\r?\n\}/, 'recordScamCandidate');
+const tierCode = grab(/function assessLearningTier[\s\S]*?\r?\n\}/, 'assessLearningTier');
 const validCode = grab(/function isValidDomain\(host\) \{[\s\S]*?\r?\n\}/, 'isValidDomain');
 const pruneCode = grab(/function pruneScamCandidates\(\) \{[\s\S]*?\r?\n\}/, 'pruneScamCandidates');
 
 function buildRecord(bl) {
   const actions = [];
   // V0.3.5：recordScamCandidate 已加入智慧加權（仿冒/跨伺服器/新帳號）——此處注入 isTyposquatOf mock 以維持「基礎計數」測試語義（加權行為由 v035 涵蓋）
-  const record = new Function('loadBlacklist', 'saveBlacklist', 'isTyposquatOf', 'OFFICIAL_DOMAINS', 'logAction', [getCandCode, recordCode, 'return recordScamCandidate;'].join('\n'))(
+  const record = new Function('loadBlacklist', 'saveBlacklist', 'isTyposquatOf', 'OFFICIAL_DOMAINS', 'logAction', [tierCode, getCandCode, recordCode, 'return recordScamCandidate;'].join('\n'))(
     () => bl,
     (d) => actions.push(['save']),
     () => false,

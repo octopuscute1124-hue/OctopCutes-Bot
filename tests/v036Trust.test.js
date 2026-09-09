@@ -96,11 +96,12 @@ check('不同使用者數=2', wr3.distinctUsers, 2);
 const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// V0.3.7：連結觀察池升級');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const shared = {};
 const bl = { scamDomains: [], scamDomainMeta: {} };
 const rc = new Function(
     'getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'OFFICIAL_DOMAINS', 'logAction',
-    src.slice(rcStart, rcEnd) + '; return recordScamCandidate;'
+    tierCode + src.slice(rcStart, rcEnd) + '; return recordScamCandidate;'
 )(() => shared, () => {}, () => bl, () => false, ['discord.com', 'discord.gg'], () => {});
 rc('multi-scam.com', { guildId: 'g1', accountAgeDays: 100, senderCount: 1 });
 check('單一發送者不加權', shared['multi-scam.com'].count, 1);

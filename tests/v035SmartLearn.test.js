@@ -42,11 +42,12 @@ check('無品牌名域名不算', isTyposquat('my-fan-page.com'), false);
 const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// 域名格式驗證');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const shared = {};
 const bl = { scamDomains: [], scamDomainMeta: {} };
 const rc = new Function(
     'getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'OFFICIAL_DOMAINS', 'logAction',
-    src.slice(rcStart, rcEnd) + '; return recordScamCandidate;'
+    tierCode + src.slice(rcStart, rcEnd) + '; return recordScamCandidate;'
 )(
     () => shared, () => {}, () => bl,
     (h) => h === 'disc0rd.com',

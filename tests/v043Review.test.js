@@ -79,6 +79,7 @@ function buildApply(bl) {
 }
 
 // ===== 2) 彙報學習品質指標 =====
+const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
 const rStart = src.indexOf('async function reportLearning');
 const rEnd = src.indexOf('// 每 24 小時執行一次學習回合');
 const rCode = src.slice(rStart, rEnd);
@@ -89,7 +90,7 @@ function buildReport(bl, guildIds) {
     const client = { guilds: { cache: new Map(guildIds.map(g => [g, { id: g }])) } };
     const embed = { fields: [], setColor() { return this; }, setTitle() { return this; }, setDescription() { return this; }, setTimestamp() { return this; }, addFields(...fs) { this.fields.push(...fs); return this; } };
     const EmbedBuilder = class { constructor() { return embed; } };
-    const report = new Function('loadBlacklist', 'sendAlert', 'EmbedBuilder', 'client', rCode + '; return reportLearning;')(
+    const report = new Function('loadBlacklist', 'sendAlert', 'EmbedBuilder', 'client', tierCode + rCode + '; return reportLearning;')(
         () => bl, async (gid, emb) => { sent.push({ gid, emb }); }, EmbedBuilder, client
     );
     return { report, sent, embed };
