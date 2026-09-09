@@ -909,11 +909,13 @@ function recordScamCandidate(host, meta = {}) {
     if (isTyposquatOf(host)) gain++;
     // V0.3.6：跨使用者共識——同一域名被 ≥2 個不同使用者發送 → 加權（多人中招更可信）
     if (typeof meta.senderCount === 'number' && meta.senderCount >= 2) gain++;
-    st.count += gain;
+    // V0.4.5：來源信譽權重——高信譽伺服器的舉報加成不打折，低信譽打折扣
+    const blNow0 = loadBlacklist();
+    const guildWeight = Math.max(0.5, 1 + (getGuildReputation(blNow0, meta.guildId) - 0.5));
+    st.count += gain * guildWeight;
     st.lastHit = Date.now();
     // V0.3.9：爆發式即時提升——多來源共識立即升級為正式詐騙域名（不等每日學習回合）
     // V0.4.4：爆發門檻也依學習品質動態調整（strict 需 5 次、tight 需 4 次、normal 需 3 次）
-    const blNow0 = loadBlacklist();
     const burstThreshold = assessLearningTier(blNow0) === 'strict' ? 5 : assessLearningTier(blNow0) === 'tight' ? 4 : 3;
     if (st.count >= burstThreshold && (st.sources || []).length >= 2) {
         const blNow = blNow0;
@@ -1010,7 +1012,14 @@ function applyLowAgeReview(host, gid, approve, by) {
     }
     blNow.rejectedDomains = blNow.rejectedDomains || {};
     blNow.rejectedDomains[host] = { at: Date.now(), by, guildId: gid, source: '管理員審核' };
-    if (blNow.scamCandidateStats && blNow.scamCandidateStats[host]) delete blNow.scamCandidateStats[host];
+    // V0.4.5：舉報來源伺服器信譽懲罰
+    if (blNow.scamCandidateStats && blNow.scamCandidateStats[host]) {
+        const gRep3 = blNow.guildReputations || (blNow.guildReputations = {});
+        for (const g of (blNow.scamCandidateStats[host].sources || [])) {
+            gRep3[g] = Math.max(0, (gRep3[g] === undefined ? 0.5 : gRep3[g]) - 0.2);
+        }
+        delete blNow.scamCandidateStats[host];
+    }
     saveBlacklist(blNow);
     if (typeof logAction === 'function') logAction('SCAM_REJECT', { domain: host, by, source: '管理員審核' });
     return { ok: true, msg: '已放行並記錄駁回（7 天防反彈）' };
@@ -1088,6 +1097,13 @@ function pruneScamCandidates() {
     if (n > 0 || decayed > 0) saveBlacklist(loadBlacklist());
     return n;
 }
+// V0.4.5：伺服器信譽——舉報品質高的伺服器計分權重更高（信譽差的伺服器難帶風向）
+// 預設 0.5（中性）；提升命中 +0.1、管理者駁回 -0.2；範圍 0~1
+function getGuildReputation(bl, guildId) {
+    const rep = (bl.guildReputations || {})[guildId];
+    return rep === undefined ? 0.5 : rep;
+}
+
 // V0.4.4：學習品質自我校準——近 30 天提升 vs 駁回率決定學習門檻等級
 // normal：駁回率 ≤10%（學得好，維持標準門檻）；tight：10~30%（收緊一級）；strict：>30%（嚴格）
 // 樣本 <3 筆不調整（避免小樣本誤判）
@@ -1137,6 +1153,11 @@ function learnScamDomains() {
             logAction('SCAM_LEARN', { domain: host, reports: st.count, confirmed: !!multiSource });
             console.log(`🧠 自主學習: ${host} 被命中 ${st.count} 次（${multiSource ? '多伺服器確認' : '單一來源'}），已加入詐騙域名`);
             learned++;
+            // V0.4.5：舉報來源伺服器信譽提升（舉報命中＝貢獻可信）
+            const gRep = bl.guildReputations || (bl.guildReputations = {});
+            for (const g of (st.sources || [])) {
+                gRep[g] = Math.min(1, (gRep[g] === undefined ? 0.5 : gRep[g]) + 0.1);
+            }
             delete candidates[host];
             continue;
         }
@@ -1924,6 +1945,12 @@ client.on(Events.InteractionCreate, async (i) => {
                         blNow.rejectedDomains = blNow.rejectedDomains || {};
                         blNow.rejectedDomains[domain] = { at: Date.now(), by: i.user.tag, guildId: gid };
                         if (typeof logAction === 'function') logAction('SCAM_REJECT', { domain, by: i.user.tag, guildId: gid });
+                        // V0.4.5：誤學來源伺服器信譽懲罰（該來源的可信度下降）
+                        const gRep2 = blNow.guildReputations || (blNow.guildReputations = {});
+                        const metaSrc2 = blNow.scamDomainMeta[domain] && blNow.scamDomainMeta[domain].sources;
+                        if (Array.isArray(metaSrc2)) {
+                            for (const g of metaSrc2) gRep2[g] = Math.max(0, (gRep2[g] === undefined ? 0.5 : gRep2[g]) - 0.2);
+                        }
                         blNow.scamDomains = blNow.scamDomains.filter(d => d !== domain);
                         delete blNow.scamDomainMeta[domain];
                         saveBlacklist(blNow);

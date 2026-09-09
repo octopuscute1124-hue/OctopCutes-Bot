@@ -18,6 +18,7 @@ const om = src.match(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/);
 if (!om) { console.error('❌ 找不到 OFFICIAL_DOMAINS'); process.exit(1); }
 const officialCode = om[0];
 const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
+const gRepCode = src.match(/function getGuildReputation[\s\S]*?\n\}/)[0];
 const now = 1700000000000;
 const cutoff = now - 30 * 86400000;
 const FakeDate = class { static now() { return now; } };
@@ -136,7 +137,7 @@ const rcCode = src.slice(rcStart, rcEnd);
 function buildRecord(shared, bl) {
     const actions = [];
     const record = new Function('getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'logAction', 'Date',
-        [tierCode, officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
+        [tierCode, gRepCode, officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
         () => shared, (d) => actions.push(['save']), () => bl, () => false,
         (t, d) => actions.push([t, d]), FakeDate
     );

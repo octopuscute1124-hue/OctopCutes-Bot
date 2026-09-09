@@ -18,6 +18,7 @@ const om = src.match(/const OFFICIAL_DOMAINS = \[[\s\S]*?\];/);
 if (!om) { console.error('❌ 找不到 OFFICIAL_DOMAINS'); process.exit(1); }
 const officialCode = om[0];
 const tierCode = src.match(/function assessLearningTier[\s\S]*?\n\}/)[0];
+const gRepCode = src.match(/function getGuildReputation[\s\S]*?\n\}/)[0];
 const rcStart = src.indexOf('function recordScamCandidate');
 const rcEnd = src.indexOf('// V0.3.7：連結觀察池升級');
 if (rcStart === -1 || rcEnd === -1) { console.error('❌ 找不到 recordScamCandidate'); process.exit(1); }
@@ -27,7 +28,7 @@ const rcCode = src.slice(rcStart, rcEnd);
 function buildRecord(shared, bl) {
     const actions = [];
     const record = new Function('getScamCandidates', 'saveBlacklist', 'loadBlacklist', 'isTyposquatOf', 'logAction',
-        [tierCode, officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
+        [tierCode, gRepCode, officialCode, rcCode, 'return recordScamCandidate;'].join('\n'))(
         () => shared, (d) => actions.push(['save']), () => bl, () => false,
         (t, d) => actions.push([t, d])
     );
