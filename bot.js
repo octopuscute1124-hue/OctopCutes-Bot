@@ -17,6 +17,11 @@ const client = new Client({
 
 const DEVELOPER_ID = process.env.DEVELOPER_ID;
 
+// V0.3.2：底層 REST 速率限制監控——429 時 discord.js 已自動退避，此處僅記錄供追查
+client.rest.on('rateLimited', (info) => {
+    writeCrash('rateLimited', new Error(`REST ${info.route} 429，重試 ${info.retryAfter}ms 後`));
+});
+
 // V0.3.0：資料檔一律以 __dirname 定位——從任何目錄啟動都不會寫錯位置
 const DATA_DIR = __dirname;
 const BLACKLIST_FILE = path.join(DATA_DIR, 'blacklist.json');
@@ -266,13 +271,13 @@ function logAdmin(interaction, action, target) {
 }
 
 // ============ Ban 函數 ============
-async function banUser(member, reason, logReason, channel = null) {
+async function banUser(member, reason, logReason, channel = null, proposeGlobal = true) {
     try {
         // V0.2.3：discord.js v14.14+ 已棄用 deleteMessageDays，改用 deleteMessageSeconds（7 天 = 604800 秒）
         await member.ban({ reason, deleteMessageSeconds: 604800 });
-        if (addToBlacklist(member.id, { reason: logReason, guildId: member.guild.id, guildName: member.guild.name })) {
-            console.log(`📋 黑名單: ${member.user.tag}`);
-        }
+        // V0.3.2：全域黑名單管理員同意制——不再自動加入，改為發送提名確認
+        let proposed = false;
+        if (proposeGlobal) proposed = await proposeGlobalBan(member, logReason, channel);
         logAction('BAN', {
             userId: member.id,
             userTag: member.user.tag,
@@ -289,7 +294,7 @@ async function banUser(member, reason, logReason, channel = null) {
                 .setDescription(`**${member.user.tag}** 已被 Ban`)
                 .addFields(
                     { name: '原因', value: logReason, inline: true },
-                    { name: '黑名單', value: `${loadBlacklist().bannedUsers.length} 人`, inline: true },
+                    { name: '全域黑名單', value: proposed ? '⏳ 待管理員確認' : '已確認，無需提名', inline: true },
                     { name: '時間', value: new Date().toLocaleString(), inline: true }
                 );
             await channel.send({ embeds: [embed] });
@@ -393,6 +398,77 @@ async function escalatePunishment(member, channel, kind, reason, opts = {}) {
         return 'timeout';
     }
     return await warnUser(member, channel, reason, kind);
+}
+
+// ============ V0.3.2 全域黑名單管理員同意制 ============
+// 設計原因：全域黑名單跨伺服器永久生效、僅開發者可解除——若開發者失聯將無人能解。
+// 因此抓人不再自動加入全域，改為：本伺服器封鎖 → 警報頻道發提名 → 管理員同意才加入全域。
+
+function canApproveGlobalBan(interaction) {
+    if (!interaction || !interaction.member) return false;
+    if (interaction.member.permissions && interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+    return isWhitelisted(interaction.member);
+}
+
+async function proposeGlobalBan(member, reason, channel = null) {
+    try {
+        const gid = member.guild.id, uid = member.id;
+        // 24 小時內同一伺服器不重複提名同一使用者
+        const k = `gb_${gid}_${uid}`;
+        const now = Date.now();
+        if (trackers.has(k) && now - trackers.get(k).last < 86400000) return false;
+        trackers.set(k, { last: now });
+        const guild = member.guild;
+        const cid = config.alertChannel[gid];
+        const target = cid ? guild.channels.cache.get(cid) : guild.systemChannel;
+        if (!target) return false;
+        const embed = new EmbedBuilder()
+            .setColor(0xff0000)
+            .setTitle('🌐 全域黑名單提名')
+            .setDescription(`**${member.user.tag}**（\`${uid}\`）已被本伺服器封鎖\n管理員確認後將加入**全域黑名單**（所有伺服器永久封鎖，僅開發者可解除）`)
+            .addFields(
+                { name: '原因', value: reason || '未知', inline: false },
+                { name: '伺服器', value: guild.name, inline: true },
+                { name: '時效', value: '24 小時內有效', inline: true }
+            )
+            .setTimestamp();
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`gb_${gid}_${uid}_approve`).setLabel('✅ 同意加入全域').setStyle(3),
+            new ButtonBuilder().setCustomId(`gb_${gid}_${uid}_reject`).setLabel('❌ 拒絕').setStyle(4)
+        );
+        const msg = await target.send({ embeds: [embed], components: [row] });
+        const collector = msg.createMessageComponentCollector({ time: 86400000 });
+        collector.on('collect', async (i) => {
+            if (!canApproveGlobalBan(i)) {
+                await i.reply({ content: '❌ 僅限管理員或白名單成員決定', ephemeral: true }).catch(() => {});
+                return;
+            }
+            const approve = i.customId.endsWith('_approve');
+            await msg.edit({ components: [] }).catch(() => {});
+            if (approve) {
+                const added = addToBlacklist(uid, { reason: `管理員同意全域封鎖：${reason || '未知'}`, guildId: gid, guildName: guild.name });
+                await i.reply({ content: added ? `✅ **${member.user.tag}** 已加入全域黑名單` : 'ℹ️ 已在全域黑名單中', ephemeral: true }).catch(() => {});
+                logAction('GLOBAL_BAN', { userId: uid, userTag: member.user.tag, guildId: gid, guildName: guild.name, reason: `管理員同意：${reason}` });
+                console.log(`🌐 全域黑名單 + ${member.user.tag}`);
+                scanAll();
+            } else {
+                await i.reply({ content: '✅ 已拒絕，僅本伺服器封鎖', ephemeral: true }).catch(() => {});
+                logAction('GLOBAL_BAN_DENIED', { userId: uid, userTag: member.user.tag, guildId: gid, guildName: guild.name, reason });
+                console.log(`🚫 拒絕全域提名: ${member.user.tag}`);
+            }
+        });
+        collector.on('end', () => { msg.edit({ components: [] }).catch(() => {}); });
+        return true;
+    } catch (e) {
+        console.error(`全域提名失敗: ${e.message}`);
+        return false;
+    }
+}
+
+// ============ V0.3.2 輸入層消毒 ============
+// 剝離零寬/隱形字元（ZWSP/ZWJ/BOM/軟連字號/雙向控制）——攻擊者常插入隱形字元繞過關鍵字偵測
+function sanitizeContent(str) {
+    return String(str || '').replace(/[\u200B-\u200D\u2060\uFEFF\u00AD\u200E\u200F\u202A-\u202E]/g, '');
 }
 
 // ============ 間隔檢測 ============
@@ -882,7 +958,7 @@ async function scanAll() {
                 for (const userId of blacklist.bannedUsers) {
                     const m = members.get(userId);
                     if (m && !m.user.bot) {
-                        if (await banUser(m, '🐙 全域黑名單', '全域掃描')) total++;
+                        if (await banUser(m, '🐙 全域黑名單', '全域掃描', null, false)) total++;
                     }
                 }
             } catch (e) { console.log(`⚠️ ${guild.name}: ${e.message}`); }
@@ -1715,6 +1791,8 @@ client.on(Events.MessageCreate, async (msg) => {
     const sec = getSecurity(gid);
     const uid = msg.author.id;
     sysStatus.requests++;
+    // V0.3.2：輸入層消毒——剝離零寬/隱形字元，防止插入隱形字元繞過偵測
+    msg.content = sanitizeContent(msg.content);
 
     // 止損
     if (sec.stopLoss !== false && (msg.content.includes('@everyone') || msg.content.includes('@here'))) {
@@ -2069,7 +2147,7 @@ client.on(Events.GuildMemberAdd, async (m) => {
         const bl = loadBlacklist();
         if (bl.bannedUsers.includes(m.id)) {
             console.log(`🔨 即時黑名單: ${m.user.tag} 加入 ${m.guild.name}，立即封鎖`);
-            try { await banUser(m, '🐙 全域黑名單', '加入即封鎖'); } catch (_) {}
+            try { await banUser(m, '🐙 全域黑名單', '加入即封鎖', null, false); } catch (_) {}
             return;
         }
     }
