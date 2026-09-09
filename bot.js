@@ -362,26 +362,40 @@ async function warnUser(member, channel, reason, tag) {
     }
 }
 
-// ============ V0.3.1 高置信度漸進處置 ============
-// 設計原則：單一規則可能誤判（例如訊息一次 @ 3 個人是正常協作），
-// 多種獨立異常在短時間內連續觸發才是高置信度訊號。
-// 因此不再「單一規則直接 Ban」，改為：警告 → 禁言 → 封鎖 的漸進式處置。
+// ============ V0.3.1+ 行為風險評分演算法 ============
+// 設計原則：不盲目依數值行事——不是「10 分鐘內湊滿 N 次」的硬計數，
+// 而是「訊號權重 × 時間半衰期」的風險累積：行為越重權重越高、越近的異常影響越大，
+// 正常使用者偶發行為會隨時間自然歸零，持續異常者分數指數累積快速升級。
 
-// 跨類型異常累積：10 分鐘內該使用者觸發的所有自動規則總數
-function countStrikes(userId, guildId) {
+// 半衰期 10 分鐘：異常發生後影響力每 10 分鐘減半
+const RISK_HALF_LIFE = 10 * 60 * 1000;
+// 訊號權重：強訊號（明確惡意）權重高；輕訊號（易誤判，如 @mention/重複）權重低
+const SIGNAL_WEIGHTS = {
+    scam: 3, xss: 3, maliciousFile: 4, collusion: 4,
+    flood: 2, stoploss: 2, script: 2, selfbot: 2, voice: 2, invite: 2, richp: 2,
+    mention: 1, dup: 1, injection: 1, textscam: 1
+};
+
+// 讀取當前風險分數（依時間衰減）
+function getRiskScore(userId, guildId) {
     const now = Date.now();
-    let total = 0;
-    const suffix = `_${userId}_${guildId}`;
-    for (const [key, d] of trackers) {
-        if (key.startsWith('strike_') && key.endsWith(suffix) && d && now - (d.last || 0) <= 600000) {
-            total += d.count;
-        }
-    }
-    return total;
+    const d = trackers.get(`risk_${userId}_${guildId}`);
+    if (!d) return 0;
+    const elapsed = now - (d.last || now);
+    if (elapsed > RISK_HALF_LIFE * 8) return 0; // 太久無活動直接歸零
+    return d.score * Math.pow(0.5, elapsed / RISK_HALF_LIFE);
 }
 
-// 漸進式處置：
-//   一般訊號：第 1 次警告（禁言 10 分鐘）→ 10 分鐘內第 2 次禁言 1 小時 → 第 3 次封鎖
+// 累加風險：分數 = 衰減後殘留分數 + 本次訊號權重
+function addRisk(userId, guildId, kind) {
+    const w = SIGNAL_WEIGHTS[kind] || 1;
+    const score = getRiskScore(userId, guildId) + w;
+    trackers.set(`risk_${userId}_${guildId}`, { score, last: Date.now() });
+    return score;
+}
+
+// 漸進式處置（風險分數門檻）：
+//   一般訊號：<6 警告（禁言 10 分鐘）→ ≥6 禁言 1 小時 → ≥10 封鎖
 //   強訊號（opts.strong）：明確惡意（詐騙連結/XSS/惡意檔案/撞庫），維持 2 次封鎖
 // 回傳 'warn' | 'timeout' | 'ban'
 async function escalatePunishment(member, channel, kind, reason, opts = {}) {
@@ -391,27 +405,26 @@ async function escalatePunishment(member, channel, kind, reason, opts = {}) {
         if (strikes >= 2) return await banUser(member, `🐙 ${reason}（累犯 ${strikes} 次）`, kind, channel);
         return await warnUser(member, channel, reason, kind);
     }
-    addStrike(uid, gid, kind);
-    const total = countStrikes(uid, gid);
-    if (total >= 3) {
-        return await banUser(member, `🐙 ${reason}（多次異常 ${total} 次）`, kind, channel);
+    const score = addRisk(uid, gid, kind);
+    if (score >= 10) {
+        return await banUser(member, `🐙 ${reason}（風險 ${score.toFixed(1)} 分）`, kind, channel);
     }
-    if (total >= 2) {
-        try { await member.timeout(3600000, `🐙 再次異常 - ${kind}`); } catch (_) {}
+    if (score >= 6) {
+        try { await member.timeout(3600000, `🐙 風險 ${score.toFixed(1)} 分 - ${kind}`); } catch (_) {}
         logAction('TIMEOUT', {
             userId: uid,
             userTag: member.user.tag,
             guildId: gid,
             guildName: member.guild.name,
-            reason: `${kind} - ${reason}`
+            reason: `${kind} - ${reason}（風險 ${score.toFixed(1)} 分）`
         });
-        console.log(`⏳ 禁言 1 小時 ${member.user.tag}: ${kind}`);
+        console.log(`⏳ 禁言 1 小時 ${member.user.tag}: ${kind}（風險 ${score.toFixed(1)} 分）`);
         if (channel) {
             try {
                 const embed = new EmbedBuilder()
                     .setColor(0xff8800)
-                    .setTitle('⏳ 再次異常（未封鎖）')
-                    .setDescription(`**${member.user.tag}** 已被禁言 1 小時，再犯將被封鎖`)
+                    .setTitle('⏳ 風險升高（未封鎖）')
+                    .setDescription(`**${member.user.tag}** 已被禁言 1 小時（風險 ${score.toFixed(1)} 分）`)
                     .addFields({ name: '原因', value: reason, inline: true })
                     .setTimestamp();
                 await channel.send({ embeds: [embed] });
@@ -690,12 +703,13 @@ function trackJoin(gid) {
 // V0.3.0：純文字釣魚偵測——無連結的贈禮/驗證詐騙話術（僅警示，不刪除不處罰）
 function detectTextScam(content) {
     const c = (content || '').toLowerCase();
+    // V0.3.4：去敏化——移除過於寬鬆的「free nitro / nitro gift」關鍵字條目（玩家聊天常見，易警報疲勞）
+    // 只保留「命令式動詞 + 贈禮」的明確釣魚組合
     const patterns = [
-        [/(?:free|claim|get|win)[\s-]+(?:discord\s+)?nitro/i, '免費 Nitro 話術'],
-        [/discord[\s-]+(?:nitro[\s-]+)?gift/i, 'Discord 贈禮話術'],
+        [/(?:claim|get|win)[\s-]+(?:discord\s+)?nitro/i, '領取 Nitro 話術'],
+        [/discord[\s-]+(?:nitro[\s-]+)?gift[\s-]+(?:code|card|link)/i, 'Discord 贈禮話術'],
         [/(?:steam|discord)[\s-]+gift[\s-]+(?:code|card)/i, '贈禮碼話術'],
-        [/verify[\s-]+(?:your|the)[\s-]+(?:account|server|discord)/i, '驗證帳號釣魚話術'],
-        [/\b(?:discordnitro|nitro\s+gift|free\s+nitro)\b/i, 'Nitro 關鍵字話術']
+        [/verify[\s-]+(?:your|the)[\s-]+(?:account|server|discord)/i, '驗證帳號釣魚話術']
     ];
     for (const [p, reason] of patterns) {
         if (p.test(c)) return reason;
@@ -715,8 +729,8 @@ function detectInjection(content) {
         [/\b(?:or|and)\b[^;\n]{0,40}=[^;\n]{0,40}--/i, 'SQL 注入（注釋繞過）'],
         [/;\s*(?:rm|sh|bash|wget|curl|nc|ncat|python3?|powershell|cmd|perl)\s/i, '命令注入（分號鏈接）'],
         [/\|\s*(?:sh|bash|nc|ncat|python3?)\s/i, '命令注入（管道執行）'],
-        [/\$\s*\(\s*[a-z_][a-z0-9_]*\s/i, '命令注入（$() 執行）'],
-        [/\x60[^\x60\n]{2,}\x60/, '命令注入（反引號執行）'],
+        [/\$\s*\(\s*(?:curl|wget|nc|ncat|bash|sh|rm|python3?|powershell|\/dev\/tcp)\b/i, '命令注入（$() 執行）'],
+        [/\x60\s*(?:curl|wget|nc|ncat|bash|sh|rm|python3?|powershell)\s/i, '命令注入（反引號執行）'],
         [/\$\{\s*(?:require|process|global|eval|Function|child_process|exec)\b/i, 'JS 注入（惡意模板）'],
         [/\{\{\s*(?:config|settings|env|this\.|process)\b/i, '模板注入']
     ];
@@ -1858,7 +1872,7 @@ client.on(Events.MessageCreate, async (msg) => {
     // @mention
     if (sec.mentionSpeed !== false) {
         const cnt = (msg.content.match(/<@[!&]?\d+>/g) || []).length;
-        if (cnt >= 3) {
+        if (cnt >= 5) {
             const r = DETECT.mentionSpeed(uid, gid);
             if (r) {
                 console.log(`⚠️ @mention: ${msg.author.tag}`);

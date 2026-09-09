@@ -68,12 +68,12 @@ check('逾 60 秒 join_ 被清理', tr2.has('join_g9'), false);
 
 // ===== detectTextScam：純文字釣魚偵測 =====
 const dts = new Function(grab(/function detectTextScam\(content\) \{[\s\S]*?\r?\n\}/, 'detectTextScam') + '; return detectTextScam;')();
-check('free nitro 話術', dts('hey check this free nitro') !== null, true);
+check('free nitro 不再誤判（V0.3.4 去敏化）', dts('hey check this free nitro'), null);
 check('claim discord nitro', dts('claim discord nitro now') !== null, true);
-check('discord gift 話術', dts('get a discord gift here') !== null, true);
+check('discord gift code 話術', dts('get a discord gift code here') !== null, true);
 check('steam gift code 話術', dts('steam gift code giveaway') !== null, true);
 check('verify your account 話術', dts('verify your discord account') !== null, true);
-check('nitro gift 關鍵字', dts('nitro gift for you') !== null, true);
+check('nitro gift 不再誤判（V0.3.4 去敏化）', dts('nitro gift for you'), null);
 check('正常訊息', dts('今天天氣很好'), null);
 check('技術討論', dts('how to use nitro emoji in discord'), null);
 check('空內容', dts(''), null);
