@@ -388,6 +388,33 @@ function getTrustTier(member) {
     return { tier: 'normal', multiplier: 1.0 };
 }
 
+// V0.4.7：智慧裁定——處置層級依「攻擊者圖譜＋伺服器信譽＋學習品質」動態調整
+// 慣犯升級（≥2 域名）；低信譽伺服器首次降級（防低信譽帶風向誤傷）；學習品質 strict 升級
+function smartAdjudicate(kind, uid, gid, score) {
+    let level = score >= 10 ? 'ban' : score >= 6 ? 'timeout' : 'warn';
+    let note = '';
+    try {
+        const prof = getAttackProfile(uid);
+        if (prof.escalation >= 2) { level = 'ban'; note = '圖譜 ' + prof.domainCount + ' 域名'; }
+        else if (prof.escalation === 1 && level === 'warn') { level = 'timeout'; note = '圖譜升級'; }
+        const scamLike = ['scam', 'maliciousFile', 'collusion', 'xss', 'invite'].indexOf(kind) !== -1;
+        if (scamLike && !prof.isAttacker) {
+            const rep = getGuildReputation(loadBlacklist(), gid);
+            if (rep < 0.35) {
+                if (level === 'ban') { level = 'timeout'; note += '低信譽降級'; }
+                else if (level === 'timeout') { level = 'warn'; note += '低信譽降級'; }
+            } else {
+                const tier = assessLearningTier(loadBlacklist());
+                if (tier === 'strict') {
+                    if (level === 'warn') { level = 'timeout'; note += '嚴格升級'; }
+                    else if (level === 'timeout') { level = 'ban'; note += '嚴格升級'; }
+                }
+            }
+        }
+    } catch (_) {}
+    return { level, note };
+}
+
 // 半衰期 10 分鐘：異常發生後影響力每 10 分鐘減半
 const RISK_HALF_LIFE = 10 * 60 * 1000;
 // 訊號權重：強訊號（明確惡意）權重高；輕訊號（易誤判，如 @mention/重複）權重低
@@ -432,18 +459,35 @@ async function escalatePunishment(member, channel, kind, reason, opts = {}) {
         else if (t.tier === 'high') tierNote = '（高信任成員）';
     } catch (_) {}
     if (opts.strong) {
+        // V0.4.7：攻擊者圖譜——詐騙/惡意訊號記錄發送者與域名關聯（跨伺服器認人）
+        let attackNote = '';
+        try {
+            if (opts.attackDomain && typeof recordAttackLink === 'function') {
+                const dc = recordAttackLink(uid, opts.attackDomain);
+                if (dc >= 2) attackNote = `（攻擊者圖譜 ${dc} 域名）`;
+            }
+        } catch (_) {}
         const strikes = addStrike(uid, gid, kind);
-        if (strikes >= 2) return await banUser(member, `🐙 ${reason}（累犯 ${strikes} 次）`, kind, channel);
-        return await warnUser(member, channel, reason + tierNote, kind);
+        if (strikes >= 2) return await banUser(member, `🐙 ${reason}（累犯 ${strikes} 次）${attackNote}`, kind, channel);
+        return await warnUser(member, channel, reason + tierNote + attackNote, kind);
     }
     const trustMultiplier = (opts.meta && typeof opts.meta.trustMultiplier === 'number')
         ? opts.meta.trustMultiplier
         : getTrustTier(member).multiplier; // V0.3.6：信任分層
     const score = addRisk(uid, gid, kind, { trustMultiplier });
-    if (score >= 10) {
-        return await banUser(member, `🐙 ${reason}（風險 ${score.toFixed(1)} 分）`, kind, channel);
+    // V0.4.7：智慧裁定——攻擊者圖譜/伺服器信譽/學習品質動態調整（環境不支援自動回退原邏輯）
+    let adjLevel = null, adjNote = '';
+    try {
+        if (typeof smartAdjudicate === 'function') {
+            const adj = smartAdjudicate(kind, uid, gid, score);
+            adjLevel = adj.level; adjNote = adj.note;
+        }
+    } catch (_) {}
+    const effScore = adjLevel === null ? score : (adjLevel === 'ban' ? 10 : adjLevel === 'timeout' ? 6 : 0);
+    if (effScore >= 10) {
+        return await banUser(member, `🐙 ${reason}（風險 ${score.toFixed(1)} 分${adjNote ? '，' + adjNote : ''}）`, kind, channel);
     }
-    if (score >= 6) {
+    if (effScore >= 6) {
         try { await member.timeout(3600000, `🐙 風險 ${score.toFixed(1)} 分 - ${kind}`); } catch (_) {}
         logAction('TIMEOUT', {
             userId: uid,
@@ -711,6 +755,35 @@ function scanFileContent(buffer, filename) {
     }
     const risk = hits.reduce((a, h) => a + h.weight, 0);
     return { hits, urls, risk };
+}
+
+// ============ V0.4.7：攻擊者圖譜（跨伺服器身份關聯） ============
+// 同一個使用者發過 ≥2 個不同詐騙域名 → 判定攻擊者（換域名也認得）
+// 資料存於 blacklist.json 的 attackGraph——跨重啟、跨伺服器持久化
+function recordAttackLink(uid, domain) {
+    try {
+        const bl = loadBlacklist();
+        bl.attackGraph = bl.attackGraph || {};
+        const a = bl.attackGraph[uid] = bl.attackGraph[uid] || { domains: [], firstSeen: Date.now(), lastSeen: Date.now() };
+        if (!a.domains.includes(domain)) a.domains.push(domain);
+        a.lastSeen = Date.now();
+        saveBlacklist(bl);
+        return a.domains.length;
+    } catch (_) { return 0; }
+}
+
+// 攻擊者輪廓：{ domainCount, isAttacker, escalation }——escalation 0=初犯 1=慣犯(2域名) 2=嚴重慣犯(3+域名)
+function getAttackProfile(uid) {
+    try {
+        const bl = loadBlacklist();
+        const a = (bl.attackGraph || {})[uid];
+        if (!a || !a.domains) return { domainCount: 0, isAttacker: false, escalation: 0 };
+        return {
+            domainCount: a.domains.length,
+            isAttacker: a.domains.length >= 2,
+            escalation: a.domains.length >= 3 ? 2 : a.domains.length >= 2 ? 1 : 0
+        };
+    } catch (_) { return { domainCount: 0, isAttacker: false, escalation: 0 }; }
 }
 
 const OFFICIAL_DOMAINS = [
@@ -2405,7 +2478,7 @@ client.on(Events.MessageCreate, async (msg) => {
                     const m = await msg.guild.members.fetch(uid);
                     if (!m.permissions.has(PermissionFlagsBits.Administrator) && !isWhitelisted(m)) {
                         await msg.delete().catch(() => {});
-                        await escalatePunishment(m, msg.channel, '詐騙連結', `偵測到可疑連結：${hit.reason}，訊息已刪除`, { strong: true });
+                        await escalatePunishment(m, msg.channel, '詐騙連結', `偵測到可疑連結：${hit.reason}，訊息已刪除`, { strong: true, attackDomain: hitHost });
                     }
                 } catch (_) {}
             }
