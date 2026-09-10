@@ -308,6 +308,14 @@ async function banUser(member, reason, logReason, channel = null, proposeGlobal 
             channelId: channel?.id || null,
             reason: logReason
         });
+        // V0.4.8：處置歷史——供管理員一鍵撤銷（誤判補救）
+        try {
+            const blH = loadBlacklist();
+            blH.actionHistory = blH.actionHistory || [];
+            blH.actionHistory.push({ kind: 'ban', uid: member.id, tag: member.user.tag, gid: member.guild.id, reason: logReason, at: Date.now(), undone: false });
+            if (blH.actionHistory.length > 200) blH.actionHistory = blH.actionHistory.slice(-200);
+            saveBlacklist(blH);
+        } catch (_) {}
         console.log(`🔨 Ban ${member.user.tag}`);
         if (channel) {
             const embed = new EmbedBuilder()
@@ -451,6 +459,13 @@ function addRisk(userId, guildId, kind, meta = {}) {
 // 回傳 'warn' | 'timeout' | 'ban'
 async function escalatePunishment(member, channel, kind, reason, opts = {}) {
     const uid = member.id, gid = member.guild.id;
+    // V0.4.8：撤銷保護——管理者已撤銷的處置 24h 內不再自動執行（誤判補救）
+    try {
+        if (typeof hasUndoProtection === 'function' && hasUndoProtection(uid, gid)) {
+            try { await warnUser(member, channel, reason + '（⚠️ 先前處置已被管理者撤銷，24h 內僅警告）', kind); } catch (_) {}
+            return 'warn';
+        }
+    } catch (_) {}
     // V0.3.9：低齡警示標記——低信任帳號（<7 天）的警告附註，管理員與成員一目了然
     let tierNote = '';
     try {
@@ -496,6 +511,14 @@ async function escalatePunishment(member, channel, kind, reason, opts = {}) {
             guildName: member.guild.name,
             reason: `${kind} - ${reason}（風險 ${score.toFixed(1)} 分）`
         });
+        // V0.4.8：處置歷史——供管理員一鍵撤銷（誤判補救）
+        try {
+            const blT = loadBlacklist();
+            blT.actionHistory = blT.actionHistory || [];
+            blT.actionHistory.push({ kind: 'timeout', uid, tag: member.user.tag, gid, reason: kind + ' - ' + reason, at: Date.now(), undone: false });
+            if (blT.actionHistory.length > 200) blT.actionHistory = blT.actionHistory.slice(-200);
+            saveBlacklist(blT);
+        } catch (_) {}
         console.log(`⏳ 禁言 1 小時 ${member.user.tag}: ${kind}（風險 ${score.toFixed(1)} 分）`);
         if (channel) {
             try {
@@ -1544,7 +1567,8 @@ async function showPanel(msg) {
             new ButtonBuilder().setCustomId('sec').setLabel('🛡️ 安全設定').setStyle(3),
             new ButtonBuilder().setCustomId('alert').setLabel('🔔 警報設定').setStyle(2),
             new ButtonBuilder().setCustomId('refresh').setLabel('🔄 刷新').setStyle(2),
-            new ButtonBuilder().setCustomId('scam').setLabel('🌐 詐騙域名').setStyle(1)
+            new ButtonBuilder().setCustomId('scam').setLabel('🌐 詐騙域名').setStyle(1),
+            new ButtonBuilder().setCustomId('undo').setLabel('↩️ 處置撤銷').setStyle(3)
         );
 
     const row2 = new ActionRowBuilder();
@@ -1751,6 +1775,60 @@ async function showManagePanel(i, type) {
     await i.reply({ embeds: [embed], components: rows, flags: 64 });
 }
 
+// ============ V0.4.8：處置可撤銷（誤判補救） ============
+// 機器人自動處置（ban/timeout）寫入 actionHistory——管理員可一鍵撤銷；
+// 撤銷後 24h 內同一成員不再被自動處置（放過就是放過）
+async function undoPunishment(guild, record) {
+    try {
+        if (record.kind === 'ban') {
+            await guild.members.unban(record.uid, '🐙 處置撤銷（管理員裁定誤判）');
+            return true;
+        }
+        if (record.kind === 'timeout') {
+            const m = await guild.members.fetch(record.uid).catch(() => null);
+            if (m) { await m.timeout(null, '🐙 處置撤銷（管理員裁定誤判）'); return true; }
+        }
+    } catch (_) {}
+    return false;
+}
+
+function hasUndoProtection(uid, gid) {
+    try {
+        const bl = loadBlacklist();
+        const hist = (bl.actionHistory || []).filter(r => r.uid === uid && r.gid === gid && r.undone && Date.now() - r.at < 86400000);
+        return hist.length > 0;
+    } catch (_) { return false; }
+}
+
+// V0.4.8：處置撤銷面板——列出最近自動處置（ban/timeout），管理員一鍵撤銷誤判
+async function showUndoPanel(i) {
+    const gid = i.guildId;
+    const bl = loadBlacklist();
+    const hist = (bl.actionHistory || []).filter(r => r.gid === gid && (r.kind === 'ban' || r.kind === 'timeout')).slice(-8).reverse();
+    const embed = new EmbedBuilder()
+        .setColor(0x00ffaa)
+        .setTitle('↩️ 處置撤銷')
+        .setDescription('機器人自動處置可能誤判——管理員可在此一鍵撤銷。撤銷後 24 小時內不會再次自動處置同一成員。')
+        .setTimestamp();
+    if (hist.length === 0) {
+        embed.addFields({ name: '📭 暫無處置記錄', value: '此伺服器目前沒有可撤銷的自動處置', inline: false });
+    } else {
+        embed.addFields({ name: '最近 ' + hist.length + ' 筆（點下方按鈕撤銷）', value: hist.map((r, i) =>
+            '**' + (i + 1) + '.** ' + (r.kind === 'ban' ? '🔨 Ban' : '⏳ 禁言') + ' · ' + r.tag + ' · ' + new Date(r.at).toLocaleString() + (r.undone ? ' · ✅ 已撤銷' : '') + ' · ' + (r.reason || '')
+        ).join('\n') || '（無）', inline: false });
+    }
+    const comps = [];
+    if (hist.length > 0) {
+        const row = new ActionRowBuilder();
+        hist.forEach((r, i) => {
+            if (i < 5) row.addComponents(new ButtonBuilder().setCustomId('undo_' + r.uid + '_' + i).setLabel('' + (i + 1) + (r.undone ? '✅' : '↩️')).setStyle(r.undone ? 2 : 3));
+        });
+        comps.push(row);
+    }
+    comps.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('back').setLabel('🔙 返回').setStyle(2)));
+    await i.reply({ embeds: [embed], components: comps, flags: 64 });
+}
+
 // ============ 自動回應面板 ============
 async function showAutoPanel(i) {
     if (i.user.id !== DEVELOPER_ID) {
@@ -1863,6 +1941,10 @@ client.on(Events.InteractionCreate, async (i) => {
             case 'scam':
                 await showScamPanel(i);
                 break;
+            case 'undo':
+                await showUndoPanel(i);
+                break;
+
             case 'stop':
                 if (!isDev) return i.reply({ content: '❌ 僅開發者', flags: 64 });
                 await i.reply({ content: '🛑 緊急停機中，再見！', flags: 64 });
@@ -1912,6 +1994,29 @@ client.on(Events.InteractionCreate, async (i) => {
                 }
                 break;
             default:
+                if (i.customId.startsWith('undo_')) {
+                    // V0.4.8：一鍵撤銷處置——customId = undo_<uid>_<列表序號>
+                    const parts = i.customId.split('_');
+                    const targetUid = parts[1];
+                    const listIdx = parseInt(parts[2], 10);
+                    const blU = loadBlacklist();
+                    const histU = (blU.actionHistory || []).filter(r => r.gid === gid && (r.kind === 'ban' || r.kind === 'timeout')).slice(-8).reverse();
+                    const rec = histU[listIdx];
+                    if (!rec || rec.uid !== targetUid) return i.reply({ content: '⚠️ 記錄不存在', flags: 64 });
+                    if (rec.undone) return i.reply({ content: 'ℹ️ 該處置已撤銷', flags: 64 });
+                    const guild = i.guild;
+                    const ok = await undoPunishment(guild, rec);
+                    if (ok) {
+                        rec.undone = true;
+                        saveBlacklist(blU);
+                        logAction('UNDO_PUNISHMENT', { userId: targetUid, guildId: gid, by: i.user.tag, kind: rec.kind });
+                        console.log('↩️ 撤銷處置: ' + rec.kind + ' ' + rec.tag);
+                        await i.reply({ content: '✅ 已撤銷 ' + (rec.kind === 'ban' ? 'Ban' : '禁言') + '（' + rec.tag + '）——24h 內不會再被自動處置', flags: 64 });
+                    } else {
+                        await i.reply({ content: '❌ 撤銷失敗（成員可能已離開或紀錄已失效）', flags: 64 });
+                    }
+                }
+
                 // 安全設定分頁
                 if (i.customId.startsWith('secpage_')) {
                     await showSecurityPanel(i, parseInt(i.customId.replace('secpage_', ''), 10) || 0);
