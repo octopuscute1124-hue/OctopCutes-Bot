@@ -665,6 +665,54 @@ const SCAM_DOMAINS = [
     'steam-codes', 'steamcodes', 'steam-free', 'netflix-gift', 'netflixgift',
     'giveaway-nitro', 'free-gift'
 ];
+// ============ V0.4.6：檔案特徵碼掃描引擎（輕量靜態偵測） ============
+// 只掃描訊息附件內容特徵——PE 頭、腳本混淆、LOLBin 下載鏈、勒索字串、雙副檔名、內嵌詐騙連結
+// 全部規則式、低誤判；命中→警示＋計入行為風險，不自動封鎖（保持漸進處置）
+const FILE_SCAN_RULES = [
+    { id: 'pe_executable', name: 'Windows 可執行檔', weight: 3,
+      test: (buf) => buf.length >= 0x40 && buf[0] === 0x4D && buf[1] === 0x5A &&
+             buf[0x3C] + 4 < buf.length && buf.readUInt32LE(buf.readUInt32LE(0x3C)) === 0x00004550 },
+    { id: 'dangerous_ext', name: '危險副檔名', weight: 2,
+      test: (buf, name) => {
+          const nm = name || '';
+          return /\.(exe|scr|bat|cmd|com|msi|js|vbs|ps1|jar|apk|sh|hta)$/i.test(nm) ||
+                 /\.(exe|scr|bat|cmd|com|js|vbs|ps1|jar|apk|sh|hta)\.(png|jpg|jpeg|gif|zip|pdf|docx|xlsx|txt|mp4|mp3)$/i.test(nm);
+      } },
+    { id: 'ps_encoded', name: 'PowerShell 編碼執行', weight: 3,
+      test: (buf) => /powershell[^\n]{0,200}?-(e|enc|encodedcommand)\b/i.test(buf.toString('latin1')) },
+    { id: 'lolbin_download', name: 'LOLBin 下載執行', weight: 3,
+      test: (buf) => /(certutil|bitsadmin|mshta|rundll32|regsvr32|wscript|cscript|curl|wget)[^\n]{0,200}?(-urlcache|\/transfer|-i\b|download|exec)/i.test(buf.toString('latin1')) },
+    { id: 'obfuscated_eval', name: '混淆執行', weight: 3,
+      test: (buf) => /eval\s*\(\s*(atob|unescape|String\.fromCharCode)|new Function\s*\(\s*(atob|unescape)/i.test(buf.toString('latin1')) },
+    { id: 'base64_blob', name: 'Base64 載入', weight: 2,
+      test: (buf) => /^[A-Za-z0-9+/=\r\n]{500,}$/m.test(buf.toString('latin1')) },
+    { id: 'ransomware', name: '勒索軟體特徵', weight: 3,
+      test: (buf) => /(bitcoin|monero|btc)[^\n]{0,60}(address|wallet)|your (files|data|documents) (have|has|are) been encrypted|to (recover|restore).{0,40}decrypt|\$\d+.{0,40}(hours|days).{0,40}(pay|send)/i.test(buf.toString('latin1')) },
+];
+
+// 掃描單一檔案：回傳 { hits:[{id,name,weight}], urls:[], risk }
+function scanFileContent(buffer, filename) {
+    const ascii = buffer.toString('latin1');
+    const hits = [];
+    for (const r of FILE_SCAN_RULES) {
+        try {
+            if (r.test(buffer, filename)) hits.push({ id: r.id, name: r.name, weight: r.weight });
+        } catch (_) {}
+    }
+    // 內嵌 URL 抽取：與詐騙黑名單＋仿冒品牌比對
+    const urls = [];
+    const re = /https?:\/\/[^\s"'<>\[\]]+/gi;
+    let m;
+    while ((m = re.exec(ascii)) && urls.length < 10) {
+        try {
+            const u = new URL(m[0]);
+            if (u.hostname) urls.push(u.hostname);
+        } catch (_) {}
+    }
+    const risk = hits.reduce((a, h) => a + h.weight, 0);
+    return { hits, urls, risk };
+}
+
 const OFFICIAL_DOMAINS = [
     'discord.com', 'discord.gg', 'discordapp.com', 'discord.js.org', 'discordjs.guide',
     'discordpy.readthedocs.io', 'steampowered.com', 'steamcommunity.com', 'github.com',
@@ -2427,6 +2475,53 @@ client.on(Events.MessageCreate, async (msg) => {
                 await sendAlert(gid, embed);
             } catch (_) {}
         }
+    }
+
+    // V0.4.6：檔案特徵碼掃描——附件內容靜態偵測（限流、限大小，防 DoS）
+    if (sec.maliciousFile !== false && msg.attachments.size > 0 && msg.attachments.size <= 5) {
+        try {
+            const scanBudget = Math.min(msg.attachments.size, 3); // 每訊息最多掃 3 個
+            let scanned = 0;
+            for (const att of msg.attachments.values()) {
+                if (scanned >= scanBudget) break;
+                // 全域限流：每 30 秒最多掃 10 個檔案（輕量防資源耗盡）
+                const nowMs = Date.now();
+                if (typeof global.__fileScanWindow === 'undefined' || nowMs - global.__fileScanWindow > 30000) {
+                    global.__fileScanWindow = nowMs;
+                    global.__fileScanCount = 0;
+                }
+                if ((global.__fileScanCount || 0) >= 10) break;
+                // 大小限制：超過 2MB 跳過（避免記憶體/帶寬消耗）
+                if (att.size > 2 * 1024 * 1024) { scanned++; continue; }
+                try {
+                    const res = await fetch(att.url);
+                    if (!res.ok) { scanned++; continue; }
+                    const ab = await res.arrayBuffer();
+                    global.__fileScanCount = (global.__fileScanCount || 0) + 1;
+                    scanned++;
+                    const { hits, urls, risk } = scanFileContent(Buffer.from(ab), att.name);
+                    if (risk === 0 && urls.length === 0) continue;
+                    // 內嵌 URL 與詐騙黑名單比對
+                    const blNow = loadBlacklist();
+                    const scamUrls = urls.filter(h => (blNow.scamDomains || []).includes(h) ||
+                        OFFICIAL_DOMAINS.some(o => h === o || h.endsWith('.' + o)) === false && isTyposquatOf(h));
+                    if (risk === 0 && scamUrls.length === 0) continue;
+                    const hitNames = hits.map(h => h.name).join('、');
+                    const emb = new EmbedBuilder()
+                        .setColor(risk >= 4 ? 0xff0000 : 0xff9900)
+                        .setTitle(risk >= 4 ? '🚨 高風險檔案' : '⚠️ 可疑檔案')
+                        .setDescription(`**${msg.author.tag}** 上傳 ``${att.name}``（${(att.size / 1024).toFixed(1)}KB）`)
+                        .addFields(
+                            { name: '特徵命中', value: hitNames || '無（內嵌連結命中）', inline: false },
+                            { name: '風險分', value: `${risk}`, inline: true },
+                            { name: '內嵌連結', value: scamUrls.length ? scamUrls.slice(0, 5).join('、') : '無', inline: true }
+                        )
+                        .setTimestamp();
+                    await sendAlert(gid, emb);
+                    if (typeof logAction === 'function') logAction('FILE_SCAN', { domain: att.name, by: msg.author.tag, guildId: gid, risk });
+                } catch (_) {}
+            }
+        } catch (_) {}
     }
 
     // 重複內容（V0.2.5）
